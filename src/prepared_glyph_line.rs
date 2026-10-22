@@ -31,6 +31,7 @@ pub struct PreparedGlyphLine {
     envelope: Option<Bounds<Pixels>>,
     glyphs: Vec<PreparedGlyph>,
     query_envelope_glyphs: usize,
+    phase_bytes: usize,
 }
 impl PreparedGlyphLine {
     /// Prepare outside paint. Errors are fatal; never substitute another font
@@ -46,8 +47,9 @@ impl PreparedGlyphLine {
             device_scale: ds,
             view_scale,
             envelope: None,
-            glyphs: Vec::new(),
+            glyphs: Vec::with_capacity(layout.runs.iter().map(|r| r.glyphs.len()).sum()),
             query_envelope_glyphs: 0,
+            phase_bytes: 0,
         };
         let system = window.text_system();
         let mut cache = std::collections::HashMap::new();
@@ -66,7 +68,11 @@ impl PreparedGlyphLine {
                 let phases = if let Some(phases) = cache.get(&key) {
                     Arc::clone(phases)
                 } else {
-                    let mut phases = Vec::new();
+                    let mut phases = Vec::with_capacity(if glyph.is_emoji {
+                        1
+                    } else {
+                        (SUBPIXEL_VARIANTS_X * SUBPIXEL_VARIANTS_Y) as usize
+                    });
                     for y in 0..if glyph.is_emoji {
                         1
                     } else {
@@ -99,6 +105,12 @@ impl PreparedGlyphLine {
                             });
                         }
                     }
+                    // Each distinct phase allocation is counted once per line,
+                    // including its Arc header and Vec capacity. Repeated glyphs
+                    // share this storage and must not multiply the charge.
+                    result.phase_bytes += std::mem::size_of::<Vec<Phase>>()
+                        + 2 * std::mem::size_of::<usize>()
+                        + phases.capacity() * std::mem::size_of::<Phase>();
                     let phases = Arc::new(phases);
                     cache.insert(key, Arc::clone(&phases));
                     phases
@@ -138,6 +150,37 @@ impl PreparedGlyphLine {
         }
         Ok(result)
     }
+    /// Storage required by `new`, excluding temporary deduplication/font-system
+    /// buffers. Repeated glyphs share phases. Call before reserving/constructing.
+    pub fn required_bytes(layout: &LineLayout) -> usize {
+        let mut unique = std::collections::HashSet::new();
+        let mut bytes = std::mem::size_of::<Self>();
+        for run in &layout.runs {
+            bytes += run.glyphs.len() * std::mem::size_of::<PreparedGlyph>();
+            for glyph in &run.glyphs {
+                if unique.insert((run.font_id, glyph.id, glyph.is_emoji)) {
+                    let phases = if glyph.is_emoji {
+                        1
+                    } else {
+                        (SUBPIXEL_VARIANTS_X * SUBPIXEL_VARIANTS_Y) as usize
+                    };
+                    bytes += std::mem::size_of::<Vec<Phase>>()
+                        + 2 * std::mem::size_of::<usize>()
+                        + phases * std::mem::size_of::<Phase>();
+                }
+            }
+        }
+        bytes
+    }
+
+    /// Owned retained capacities (not GPU atlas/font-system/allocator storage).
+    /// Phase Arcs shared by repeated glyphs are charged once within this line.
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.glyphs.capacity() * std::mem::size_of::<PreparedGlyph>()
+            + self.phase_bytes
+    }
+
     fn union(&mut self, b: Bounds<Pixels>) {
         self.envelope = Some(self.envelope.map_or(b, |old| old.union(&b)));
     }
