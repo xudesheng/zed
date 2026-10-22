@@ -1,6 +1,11 @@
 //! Bounded native isolated layers. Preparation owns resources; frame/replay and
 //! GPU completion retain them independently of the preparing element.
 use crate::{Bounds, Pixels, Size, Window, WindowId};
+use futures::{
+    FutureExt,
+    channel::oneshot,
+    future::{BoxFuture, Shared},
+};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -32,7 +37,7 @@ pub struct PreparedIsolatedLayer {
     pub(crate) window: WindowId,
     pub(crate) scale: f32,
     pub(crate) size: Size<Pixels>,
-    pub(crate) failed: Arc<AtomicBool>,
+    pub(crate) failure: Arc<FailureSignal>,
     pub(crate) recording: Arc<AtomicBool>,
     #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
     pub(crate) metal: Arc<crate::metal_renderer::IsolatedTextures>,
@@ -50,10 +55,51 @@ impl PreparedIsolatedLayer {
     /// Check before publishing/painting a retained generation, including errors
     /// reported asynchronously by the GPU completion handler.
     pub fn is_failed(&self) -> bool {
-        self.failed.load(Ordering::Acquire)
+        self.failure.failed.load(Ordering::Acquire)
+    }
+    /// Resolves once this target suffers a terminal GPU failure, including if it
+    /// already failed. Each caller is notified; cancelling a waiter is harmless.
+    /// The future does not retain the target's textures or window reservation.
+    pub fn failure(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.failure.wait.clone()
     }
     pub(crate) fn fail(&self) {
+        self.failure.fail();
+    }
+}
+
+// One shared completion instead of an AtomicWaker: replay/preparation owners may
+// subscribe independently. Registration and failure cannot lose a wakeup.
+pub(crate) struct FailureSignal {
+    failed: AtomicBool,
+    sender: parking_lot::Mutex<Option<oneshot::Sender<()>>>,
+    wait: Shared<BoxFuture<'static, ()>>,
+}
+impl Default for FailureSignal {
+    fn default() -> Self {
+        let (sender, receiver) = oneshot::channel();
+        Self {
+            failed: AtomicBool::new(false),
+            sender: parking_lot::Mutex::new(Some(sender)),
+            // Sender drop is cancellation, not a device failure. A cancelled
+            // owner drops its future; no completion should be synthesized.
+            wait: async move {
+                if receiver.await.is_err() {
+                    futures::future::pending::<()>().await;
+                }
+            }
+            .boxed()
+            .shared(),
+        }
+    }
+}
+impl FailureSignal {
+    fn fail(&self) {
         self.failed.store(true, Ordering::Release);
+        let sender = self.sender.lock().take();
+        if let Some(sender) = sender {
+            let _ = sender.send(());
+        }
     }
 }
 
@@ -80,7 +126,8 @@ impl Window {
 
     /// Record children into a separate native Scene, then composite once in the
     /// parent order. The closure should only paint. Recording restores Scene,
-    /// clip and opacity on success, error and unwinding panic.
+    /// clip and opacity on success, error and unwinding panic. Hitboxes, cursor
+    /// styles and deferred element draws are not isolated: do not record them here.
     pub fn paint_isolated_layer<E>(
         &mut self,
         target: &PreparedIsolatedLayer,
@@ -217,5 +264,28 @@ mod tests {
         drop(child);
         drop(parent);
         assert!(pool.reserve(TARGET_POOL_BYTES).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod notification_tests {
+    use super::*;
+    #[test]
+    fn failure_wakes_all_waiters_including_late_subscribers() {
+        futures::executor::block_on(async {
+            let signal = Arc::new(FailureSignal::default());
+            let mut first = Box::pin(signal.wait.clone());
+            let mut second = Box::pin(signal.wait.clone());
+            assert!(futures::poll!(&mut first).is_pending());
+            assert!(futures::poll!(&mut second).is_pending());
+            drop(signal.wait.clone()); // cancelling another subscriber changes nothing
+            let worker = signal.clone();
+            std::thread::spawn(move || worker.fail()).join().unwrap();
+            assert!(signal.failed.load(Ordering::Acquire));
+            assert!(futures::poll!(&mut first).is_ready());
+            assert!(futures::poll!(&mut second).is_ready());
+            assert!(signal.wait.clone().now_or_never().is_some());
+            signal.fail(); // idempotent
+        });
     }
 }

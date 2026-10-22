@@ -39,3 +39,13 @@ target placements, replay, quota exhaustion/recovery, encoding-failure state
 restoration, command-buffer retention after Scene drop, and window probes for
 mixed paths/glyphs/clips at four zooms. This is macOS evidence, not other-backend
 conformance. Keep all generated captures/logs outside this repository.
+
+Isolated targets additionally expose `failure()`, a multi-subscriber completion
+future. Terminal GPU command-buffer failure wakes current owners without a new
+input/frame; late subscribers observe the same completion. Waiters retain no
+textures or quota reservations. Cancelling a waiter is harmless. Cached Scene
+replay skips only a failed composite so unrelated window content still presents.
+Missing drawables and the instance-buffer growth cap are transient frame skips,
+not permanent target failures. Only genuine terminal GPU errors poison retained
+targets. Recording closures must not create hitboxes, cursor styles or deferred
+element draws; only Scene, clip and opacity state are isolated/restored.

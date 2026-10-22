@@ -440,14 +440,6 @@ impl MetalRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
-        let mut targets = Vec::new();
-        collect_isolated_targets(scene, &mut targets);
-        if targets.iter().any(|t| t.is_failed()) {
-            for target in &targets {
-                target.fail();
-            }
-            return;
-        }
         let layer = self.layer.clone();
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
@@ -457,9 +449,7 @@ impl MetalRenderer {
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
-            for target in &targets {
-                target.fail();
-            }
+            // Drawable unavailability is a transient frame skip.
             log::error!(
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
@@ -503,9 +493,8 @@ impl MetalRenderer {
                     let mut instance_buffer_pool = self.instance_buffer_pool.lock();
                     let buffer_size = instance_buffer_pool.buffer_size;
                     if buffer_size >= 256 * 1024 * 1024 {
-                        for target in &targets {
-                            target.fail();
-                        }
+                        // Instance-buffer pressure skips this frame; the
+                        // prepared target remains valid for a later retry.
                         log::error!("instance buffer size grew too large: {}", buffer_size);
                         break;
                     }
@@ -644,6 +633,12 @@ impl MetalRenderer {
         for batch in scene.batches() {
             let ok = match batch {
                 PrimitiveBatch::Isolated(layer) => {
+                    // Cached paint can replay a target failed after Codi's
+                    // preflight. Omit only that composite, not the window or
+                    // unrelated siblings. The owner is woken by failure().
+                    if layer.target.is_failed() {
+                        continue;
+                    }
                     // Render and consume this placement before another placement
                     // reuses the same prepared target. Descendants still finish
                     // before their parent composite; tracked heap hazards order
@@ -1697,7 +1692,7 @@ impl MetalRenderer {
             window,
             scale,
             size: logical,
-            failed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            failure: Arc::new(crate::isolated::FailureSignal::default()),
             recording: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metal: Arc::new(IsolatedTextures {
                 pixel_size,
@@ -1899,6 +1894,31 @@ mod isolated_tests {
         assert_eq!(pixel(&image, 12, 8), [255, 0, 0, 255]);
     }
     #[test]
+    fn poisoned_replayed_layer_does_not_suppress_window_or_siblings() {
+        let mut renderer = MetalRenderer::new(Arc::new(Mutex::new(Default::default())));
+        let mut red = Scene::default();
+        quad(&mut red, bounds(0., 0., 16., 16.), 0xff0000ff);
+        red.finish();
+        let failed = layer(&renderer, red, 1.);
+        let owner = failed.target.clone();
+        let mut blue = Scene::default();
+        quad(&mut blue, bounds(8., 0., 8., 16.), 0x0000ffff);
+        blue.finish();
+        let healthy = layer(&renderer, blue, 1.);
+        let healthy_owner = healthy.target.clone();
+        let mut cached = Scene::default();
+        quad(&mut cached, bounds(0., 0., 16., 16.), 0xffffffff);
+        cached.insert_primitive(crate::Primitive::Isolated(failed));
+        cached.insert_primitive(crate::Primitive::Isolated(healthy));
+        let mut replay = Scene::default();
+        replay.replay(0..cached.len(), &cached);
+        owner.fail(); // completion after view recording, before cached replay
+        let image = pixels(&mut renderer, replay);
+        assert_eq!(pixel(&image, 2, 8), [255, 255, 255, 255]);
+        assert_eq!(pixel(&image, 12, 8), [255, 0, 0, 255]);
+        assert!(!healthy_owner.is_failed());
+    }
+    #[test]
     fn command_buffer_retains_target_after_scene_drop_until_retirement() {
         let renderer = MetalRenderer::new(Arc::new(Mutex::new(Default::default())));
         let weak = objc::rc::autoreleasepool(|| {
@@ -1952,10 +1972,11 @@ mod isolated_tests {
         assert!(renderer.path_intermediate_texture.is_none());
         assert!(renderer.path_intermediate_msaa_texture.is_none());
         assert_eq!(pipeline, renderer.quads_pipeline_state.as_ptr());
-        // The terminal failure branch publishes poison through every retained
-        // owner. A transient instance-buffer exhaustion may instead retry.
-        owner.fail();
-        assert!(scene.isolated[0].target.is_failed());
+        // Buffer exhaustion is transient: the same retained generation retries.
+        assert!(!owner.is_failed());
+        let image = pixels(&mut renderer, scene);
+        assert_eq!(pixel(&image, 2, 2), [0, 0, 128, 128]);
+        assert!(!owner.is_failed());
         let mut next = Scene::default();
         quad(&mut next, bounds(0., 0., 16., 16.), 0x0000ffff);
         assert_eq!(pixel(&pixels(&mut renderer, next), 8, 8), [255, 0, 0, 255]);
