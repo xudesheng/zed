@@ -50,6 +50,37 @@ use super::open_type::apply_features_and_fallbacks;
 #[allow(non_upper_case_globals)]
 const kCGImageAlphaOnly: u32 = 7;
 
+// Shared by query and allocation. This is the existing macOS raster rule,
+// not a platform-independent padding estimate. Empty glyphs are handled by
+// the caller before either rasterization or a positioned bounds query.
+fn glyph_bitmap_size(
+    params: &RenderGlyphParams,
+    bounds: Bounds<DevicePixels>,
+) -> Result<Size<DevicePixels>> {
+    anyhow::ensure!(
+        bounds.size.width.0 > 0 && bounds.size.height.0 > 0,
+        "glyph bounds are empty"
+    );
+    Ok(size(
+        DevicePixels(
+            bounds
+                .size
+                .width
+                .0
+                .checked_add(i32::from(params.subpixel_variant.x > 0))
+                .ok_or_else(|| anyhow!("glyph width overflow"))?,
+        ),
+        DevicePixels(
+            bounds
+                .size
+                .height
+                .0
+                .checked_add(i32::from(params.subpixel_variant.y > 0))
+                .ok_or_else(|| anyhow!("glyph height overflow"))?,
+        ),
+    ))
+}
+
 pub(crate) struct MacTextSystem(RwLock<MacTextSystemState>);
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -152,6 +183,81 @@ impl PlatformTextSystem for MacTextSystem {
         }
     }
 
+    fn has_outline_only_bounds(&self, font_id: FontId) -> Result<bool> {
+        let lock = self.0.read();
+        let font = lock
+            .fonts
+            .get(font_id.0)
+            .ok_or_else(|| anyhow!("invalid font id"))?;
+        // Read tags, never copy the potentially 192 MB sbix table.
+        let tags = font
+            .native_font()
+            .get_available_font_tables()
+            .ok_or_else(|| anyhow!("font has no table directory"))?;
+        let has = |tag: &[u8; 4]| tags.iter().any(|value| *value == u32::from_be_bytes(*tag));
+        Ok([b"glyf", b"CFF ", b"CFF2"].iter().any(|tag| has(tag))
+            && ![b"sbix", b"CBDT", b"EBDT", b"COLR", b"SVG ", b"hvgl"]
+                .iter()
+                .any(|tag| has(tag)))
+    }
+
+    fn resolved_face(&self, font_id: FontId) -> Result<crate::ResolvedFace> {
+        let lock = self.0.read();
+        let font = lock
+            .fonts
+            .get(font_id.0)
+            .ok_or_else(|| anyhow::anyhow!("invalid font id"))?;
+        let native = font.native_font();
+        let path = native
+            .url()
+            .and_then(|url| url.to_path())
+            .ok_or_else(|| anyhow!("resolved font has no file URL"))?;
+        let mut tables = Vec::new();
+        for tag in [*b"head", *b"name", *b"fvar"] {
+            let data = native.get_font_table(u32::from_be_bytes(tag));
+            if data.as_ref().is_some_and(|data| data.len() > 1024 * 1024) {
+                anyhow::bail!("resolved font table exceeds witness limit");
+            }
+            tables.push((tag, data.map(|data| data.bytes().to_vec())));
+        }
+        // core-text 21 omits the binding, but CoreText owns this API and its
+        // create-rule dictionary of numeric axis identifiers/coordinates.
+        unsafe extern "C" {
+            fn CTFontCopyVariation(
+                font: core_text::font::CTFontRef,
+            ) -> core_foundation::dictionary::CFDictionaryRef;
+        }
+        let mut variations = Vec::new();
+        unsafe {
+            let raw = CTFontCopyVariation(native.as_concrete_TypeRef());
+            if !raw.is_null() {
+                let values: core_foundation::dictionary::CFDictionary<CFNumber, CFNumber> =
+                    TCFType::wrap_under_create_rule(raw);
+                let (keys, values) = values.get_keys_and_values();
+                for (key, value) in keys.into_iter().zip(values) {
+                    let key = CFNumber::wrap_under_get_rule(key.cast())
+                        .to_i64()
+                        .ok_or_else(|| anyhow!("invalid variation axis identifier"))?;
+                    let value = CFNumber::wrap_under_get_rule(value.cast())
+                        .to_f64()
+                        .filter(|v| v.is_finite())
+                        .ok_or_else(|| anyhow!("invalid variation coordinate"))?;
+                    variations.push((u32::try_from(key)?, value));
+                }
+            }
+        }
+        variations.sort_by_key(|axis| axis.0);
+        Ok(crate::ResolvedFace {
+            path,
+            tables,
+            variations,
+            family: font.family_name(),
+            postscript_name: font
+                .postscript_name()
+                .ok_or_else(|| anyhow::anyhow!("missing PostScript name"))?,
+        })
+    }
+
     fn font_metrics(&self, font_id: FontId) -> FontMetrics {
         self.0.read().fonts[font_id.0].metrics().into()
     }
@@ -172,6 +278,14 @@ impl PlatformTextSystem for MacTextSystem {
 
     fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
         self.0.read().raster_bounds(params)
+    }
+
+    fn glyph_bitmap_size(
+        &self,
+        params: &RenderGlyphParams,
+        bounds: Bounds<DevicePixels>,
+    ) -> Result<Size<DevicePixels>> {
+        glyph_bitmap_size(params, bounds)
     }
 
     fn rasterize_glyph(
@@ -349,15 +463,7 @@ impl MacTextSystemState {
         if glyph_bounds.size.width.0 == 0 || glyph_bounds.size.height.0 == 0 {
             anyhow::bail!("glyph bounds are empty");
         } else {
-            // Add an extra pixel when the subpixel variant isn't zero to make room for anti-aliasing.
-            let mut bitmap_size = glyph_bounds.size;
-            if params.subpixel_variant.x > 0 {
-                bitmap_size.width += DevicePixels(1);
-            }
-            if params.subpixel_variant.y > 0 {
-                bitmap_size.height += DevicePixels(1);
-            }
-            let bitmap_size = bitmap_size;
+            let bitmap_size = glyph_bitmap_size(params, glyph_bounds)?;
 
             let mut bytes;
             let cx;
@@ -709,6 +815,7 @@ mod lenient_font_attributes {
 
 #[cfg(test)]
 mod tests {
+    use crate::{FontFallbacks, IsZero, Point, RenderGlyphParams, SUBPIXEL_VARIANTS_X, point};
     use crate::{FontRun, GlyphId, MacTextSystem, PlatformTextSystem, font, px};
 
     #[test]
@@ -842,5 +949,123 @@ mod tests {
         let layout = fonts.layout_line(text, px(16.), font_runs);
         assert_eq!(layout.len, 0);
         assert!(layout.runs.is_empty());
+    }
+
+    #[test]
+    fn mermaid_affine_bitmap_rule_matches_raster() {
+        let fonts = MacTextSystem::new();
+        let mut request = font("Helvetica");
+        request.fallbacks = Some(FontFallbacks::from_fonts(vec![
+            "PingFang SC".into(),
+            "Apple Color Emoji".into(),
+        ]));
+        let font_id = fonts.font_id(&request).unwrap();
+        let text = "office ffi 中文 😀 x\u{302}\u{302}\u{302}\u{302} q\u{323}\u{307} किं   ";
+        let layout = fonts.layout_line(
+            text,
+            px(16.),
+            &[FontRun {
+                font_id,
+                len: text.len(),
+            }],
+        );
+        let mut checked = 0;
+        let mut empty = 0;
+        for run in &layout.runs {
+            for glyph in &run.glyphs {
+                for scale in [0.5, 1.0, 1.5, 2.0, 3.0, 4.0] {
+                    for x in 0..SUBPIXEL_VARIANTS_X {
+                        for y in 0..crate::SUBPIXEL_VARIANTS_Y {
+                            let params = RenderGlyphParams {
+                                font_id: run.font_id,
+                                glyph_id: glyph.id,
+                                font_size: px(16.),
+                                subpixel_variant: if glyph.is_emoji {
+                                    Point::default()
+                                } else {
+                                    point(x, y)
+                                },
+                                scale_factor: scale,
+                                is_emoji: glyph.is_emoji,
+                            };
+                            let bounds = fonts.glyph_raster_bounds(&params).unwrap();
+                            if bounds.is_zero() {
+                                empty += 1;
+                                continue;
+                            }
+                            let queried = fonts.glyph_bitmap_size(&params, bounds).unwrap();
+                            let (actual, bytes) = fonts.rasterize_glyph(&params, bounds).unwrap();
+                            assert_eq!(queried, actual);
+                            let channels = if glyph.is_emoji { 4 } else { 1 };
+                            assert_eq!(
+                                bytes.len(),
+                                actual.width.0 as usize * actual.height.0 as usize * channels
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 0 && empty > 0);
+        eprintln!("bitmap-size comparisons: {checked}, zero-ink skips: {empty}");
+    }
+
+    #[test]
+    fn mermaid_affine_coretext_handle_diagnostic() {
+        let fonts = MacTextSystem::new();
+        let mut request = font("Helvetica");
+        request.fallbacks = Some(FontFallbacks::from_fonts(vec![
+            "PingFang SC".into(),
+            "Apple Color Emoji".into(),
+        ]));
+        let id = fonts.font_id(&request).unwrap();
+        let text = "中文 😀 किं";
+        let layout = fonts.layout_line(
+            text,
+            px(16.),
+            &[FontRun {
+                font_id: id,
+                len: text.len(),
+            }],
+        );
+        for run in &layout.runs {
+            let witness = fonts.resolved_face(run.font_id).unwrap();
+            assert!(witness.path.is_absolute());
+            assert_eq!(witness.tables.len(), 3);
+            assert!(witness.tables[0].1.is_some());
+            assert!(witness.tables[1].1.is_some());
+            assert!(
+                witness
+                    .variations
+                    .iter()
+                    .all(|(_, value)| value.is_finite())
+            );
+            eprintln!(
+                "native witness: {} {:?} tables={:?}",
+                witness.postscript_name,
+                witness.variations,
+                witness
+                    .tables
+                    .iter()
+                    .map(|(tag, data)| (String::from_utf8_lossy(tag), data.as_ref().map(Vec::len)))
+                    .collect::<Vec<_>>()
+            );
+        }
+        let lock = fonts.0.read();
+        for run in &layout.runs {
+            let face = &lock.fonts[run.font_id.0];
+            let path = face.native_font().url().and_then(|url| url.to_path());
+            eprintln!(
+                "face={}, handle={:?}, CoreText path={:?}",
+                face.postscript_name().unwrap(),
+                face.handle(),
+                path
+            );
+            // Pinned zed-font-kit discards data in from_native_font. Its default
+            // Loader::handle would manufacture index 0 even if data existed.
+            assert!(face.handle().is_none());
+            assert!(path.is_some());
+        }
     }
 }

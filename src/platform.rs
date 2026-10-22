@@ -579,10 +579,25 @@ pub(crate) trait PlatformTextSystem: Send + Sync {
     fn all_font_names(&self) -> Vec<String>;
     fn font_id(&self, descriptor: &Font) -> Result<FontId>;
     fn font_metrics(&self, font_id: FontId) -> FontMetrics;
+    fn resolved_face(&self, _font_id: FontId) -> Result<crate::ResolvedFace> {
+        anyhow::bail!("resolved face identity is not implemented on this platform")
+    }
+    /// Only standard outline-only faces may use their declared font box.
+    fn has_outline_only_bounds(&self, _font_id: FontId) -> Result<bool> {
+        anyhow::bail!("font technology query is not implemented on this platform")
+    }
     fn typographic_bounds(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Bounds<f32>>;
     fn advance(&self, font_id: FontId, glyph_id: GlyphId) -> Result<Size<f32>>;
     fn glyph_for_char(&self, font_id: FontId, ch: char) -> Option<GlyphId>;
     fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>>;
+    /// Bitmap allocation size from the platform raster rule, without rasterizing.
+    fn glyph_bitmap_size(
+        &self,
+        _params: &RenderGlyphParams,
+        _bounds: Bounds<DevicePixels>,
+    ) -> Result<Size<DevicePixels>> {
+        anyhow::bail!("glyph bitmap size query is not implemented on this platform")
+    }
     fn rasterize_glyph(
         &self,
         params: &RenderGlyphParams,

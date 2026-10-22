@@ -2953,50 +2953,24 @@ impl Window {
         font_size: Pixels,
         color: Hsla,
     ) -> Result<()> {
-        self.invalidator.debug_assert_paint();
+        self.paint_glyph_at_scale(origin, font_id, glyph_id, font_size, 1.0, color)
+    }
 
-        let element_opacity = self.element_opacity();
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
-
-        let subpixel_variant = Point {
-            x: (glyph_origin.x.0.fract() * SUBPIXEL_VARIANTS_X as f32).floor() as u8,
-            y: (glyph_origin.y.0.fract() * SUBPIXEL_VARIANTS_Y as f32).floor() as u8,
-        };
-        let params = RenderGlyphParams {
-            font_id,
-            glyph_id,
-            font_size,
-            subpixel_variant,
-            scale_factor,
-            is_emoji: false,
-        };
-
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
-        if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(&params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
-            let bounds = Bounds {
-                origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
-                size: tile.bounds.size.map(Into::into),
-            };
-            let content_mask = self.content_mask().scale(scale_factor);
-            self.next_frame.scene.insert_primitive(MonochromeSprite {
-                order: 0,
-                pad: 0,
-                bounds,
-                content_mask,
-                color: color.opacity(element_opacity),
-                tile,
-                transformation: TransformationMatrix::unit(),
-            });
-        }
-        Ok(())
+    /// Paint an already shaped glyph with affine view zoom, retaining its base font size.
+    /// `origin` is already in displayed logical coordinates; zoom is not applied to it again.
+    pub fn paint_glyph_at_scale(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        view_scale: f32,
+        color: Hsla,
+    ) -> Result<()> {
+        let params =
+            self.affine_glyph_params(origin, font_id, glyph_id, font_size, view_scale, false)?;
+        let raster = self.text_system().raster_bounds(&params)?;
+        self.paint_prepared_glyph(origin, &params, raster, None, color)
     }
 
     /// Paints an emoji glyph into the scene for the next frame at the current z-index.
@@ -3014,37 +2988,61 @@ impl Window {
         glyph_id: GlyphId,
         font_size: Pixels,
     ) -> Result<()> {
+        self.paint_emoji_at_scale(origin, font_id, glyph_id, font_size, 1.0)
+    }
+
+    /// Emoji counterpart of `paint_glyph_at_scale`; the original font strike is retained.
+    pub fn paint_emoji_at_scale(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        view_scale: f32,
+    ) -> Result<()> {
+        let params =
+            self.affine_glyph_params(origin, font_id, glyph_id, font_size, view_scale, true)?;
+        let raster = self.text_system().raster_bounds(&params)?;
+        self.paint_prepared_glyph(origin, &params, raster, None, Hsla::default())
+    }
+
+    /// Submit retained metrics. Only a cold atlas miss rasterizes; no shape or
+    /// bounds measurement is performed by prepared-line paint.
+    pub(crate) fn paint_prepared_glyph(
+        &mut self,
+        origin: Point<Pixels>,
+        params: &RenderGlyphParams,
+        raster: Bounds<DevicePixels>,
+        bitmap_size: Option<Size<DevicePixels>>,
+        color: Hsla,
+    ) -> Result<()> {
         self.invalidator.debug_assert_paint();
-
-        let scale_factor = self.scale_factor();
-        let glyph_origin = origin.scale(scale_factor);
-        let params = RenderGlyphParams {
-            font_id,
-            glyph_id,
-            font_size,
-            // We don't render emojis with subpixel variants.
-            subpixel_variant: Default::default(),
-            scale_factor,
-            is_emoji: true,
+        if raster.is_zero() {
+            return Ok(());
+        }
+        let tile = self
+            .sprite_atlas
+            .get_or_insert_with(&params.clone().into(), &mut || {
+                let (size, bytes) = self.text_system().rasterize_glyph(params)?;
+                anyhow::ensure!(
+                    bitmap_size.is_none_or(|expected| size == expected),
+                    "prepared glyph bitmap size changed"
+                );
+                Ok(Some((size, Cow::Owned(bytes))))
+            })?
+            .expect("Callback above only errors or returns Some");
+        anyhow::ensure!(
+            bitmap_size.is_none_or(|expected| tile.bounds.size == expected),
+            "atlas glyph size changed"
+        );
+        let ds = self.scale_factor();
+        let bounds = Bounds {
+            origin: origin.scale(ds).map(|p| p.floor()) + raster.origin.map(Into::into),
+            size: tile.bounds.size.map(Into::into),
         };
-
-        let raster_bounds = self.text_system().raster_bounds(&params)?;
-        if !raster_bounds.is_zero() {
-            let tile = self
-                .sprite_atlas
-                .get_or_insert_with(&params.clone().into(), &mut || {
-                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
-                    Ok(Some((size, Cow::Owned(bytes))))
-                })?
-                .expect("Callback above only errors or returns Some");
-
-            let bounds = Bounds {
-                origin: glyph_origin.map(|px| px.floor()) + raster_bounds.origin.map(Into::into),
-                size: tile.bounds.size.map(Into::into),
-            };
-            let content_mask = self.content_mask().scale(scale_factor);
-            let opacity = self.element_opacity();
-
+        let content_mask = self.content_mask().scale(ds);
+        let opacity = self.element_opacity();
+        if params.is_emoji {
             self.next_frame.scene.insert_primitive(PolychromeSprite {
                 order: 0,
                 pad: 0,
@@ -3055,8 +3053,97 @@ impl Window {
                 tile,
                 opacity,
             });
+        } else {
+            self.next_frame.scene.insert_primitive(MonochromeSprite {
+                order: 0,
+                pad: 0,
+                bounds,
+                content_mask,
+                color: color.opacity(opacity),
+                tile,
+                transformation: TransformationMatrix::unit(),
+            });
         }
         Ok(())
+    }
+
+    pub(crate) fn affine_glyph_params(
+        &self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        view_scale: f32,
+        is_emoji: bool,
+    ) -> Result<RenderGlyphParams> {
+        let device_scale = self.scale_factor();
+        let raster_scale = device_scale * view_scale;
+        anyhow::ensure!(
+            view_scale.is_finite()
+                && view_scale > 0.0
+                && raster_scale.is_finite()
+                && raster_scale > 0.0
+                && font_size.0.is_finite()
+                && font_size.0 > 0.0
+                && origin.x.0.is_finite()
+                && origin.y.0.is_finite(),
+            "invalid glyph transform"
+        );
+        let physical_origin = origin.scale(device_scale);
+        anyhow::ensure!(
+            physical_origin.x.0.is_finite() && physical_origin.y.0.is_finite(),
+            "glyph origin overflow"
+        );
+        Ok(RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size,
+            subpixel_variant: if is_emoji {
+                Point::default()
+            } else {
+                Point {
+                    x: (physical_origin.x.0.fract() * SUBPIXEL_VARIANTS_X as f32).floor() as u8,
+                    y: (physical_origin.y.0.fract() * SUBPIXEL_VARIANTS_Y as f32).floor() as u8,
+                }
+            },
+            scale_factor: raster_scale,
+            is_emoji,
+        })
+    }
+
+    /// Actual positioned bitmap bounds in displayed logical pixels. Uses the same
+    /// raster parameters and bitmap size as the affine painter, including phase
+    /// extension. None means zero ink. Call during preparation, never for layout
+    /// with a guessed font or substituted glyph. The platform supplies the same
+    /// bitmap-size rule used by rasterization, without allocating bitmap bytes.
+    pub fn glyph_paint_bounds_at_scale(
+        &self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        font_size: Pixels,
+        view_scale: f32,
+        is_emoji: bool,
+    ) -> Result<Option<Bounds<Pixels>>> {
+        let params =
+            self.affine_glyph_params(origin, font_id, glyph_id, font_size, view_scale, is_emoji)?;
+        let raster = self.text_system().raster_bounds(&params)?;
+        if raster.is_zero() {
+            return Ok(None);
+        }
+        let bitmap_size = self.text_system().glyph_bitmap_size(&params, raster)?;
+        let ds = self.scale_factor();
+        let physical_origin = origin.scale(ds);
+        Ok(Some(Bounds {
+            origin: point(
+                px((physical_origin.x.0.floor() + raster.origin.x.0 as f32) / ds),
+                px((physical_origin.y.0.floor() + raster.origin.y.0 as f32) / ds),
+            ),
+            size: size(
+                px(bitmap_size.width.0 as f32 / ds),
+                px(bitmap_size.height.0 as f32 / ds),
+            ),
+        }))
     }
 
     /// Paint a monochrome SVG into the scene for the next frame at the current stacking context.

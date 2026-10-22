@@ -130,7 +130,18 @@ impl TextSystem {
         }
     }
 
-    /// Get the Font for the Font Id.
+    /// Whether the resolved face declares standard outlines without a bitmap,
+    /// color or private glyph technology that invalidates its font-box bound.
+    pub(crate) fn has_outline_only_bounds(&self, id: FontId) -> Result<bool> {
+        self.platform_text_system.has_outline_only_bounds(id)
+    }
+
+    /// Native table witnesses and effective variation coordinates for a resolved font.
+    pub fn resolved_face(&self, id: FontId) -> Result<ResolvedFace> {
+        self.platform_text_system.resolved_face(id)
+    }
+
+    /// Return the original requested font, if the id is known to the request cache.
     pub fn get_font_for_id(&self, id: FontId) -> Option<Font> {
         let lock = self.font_ids_by_font.read();
         lock.iter()
@@ -316,6 +327,14 @@ impl TextSystem {
             raster_bounds.insert(params.clone(), bounds);
             Ok(bounds)
         }
+    }
+
+    pub(crate) fn glyph_bitmap_size(
+        &self,
+        params: &RenderGlyphParams,
+        bounds: Bounds<DevicePixels>,
+    ) -> Result<Size<DevicePixels>> {
+        self.platform_text_system.glyph_bitmap_size(params, bounds)
     }
 
     pub(crate) fn rasterize_glyph(
@@ -759,6 +778,13 @@ impl TextRun {
 #[repr(C)]
 pub struct GlyphId(pub(crate) u32);
 
+impl GlyphId {
+    /// Platform glyph index, meaningful only with its verified resolved face.
+    pub fn as_u32(self) -> u32 {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RenderGlyphParams {
     pub(crate) font_id: FontId,
@@ -780,6 +806,24 @@ impl Hash for RenderGlyphParams {
         self.scale_factor.to_bits().hash(state);
         self.is_emoji.hash(state);
     }
+}
+
+/// Native face witnesses for preparation outside paint. The locator and names
+/// are not identities: consumers must uniquely verify tables against retained
+/// file bytes, account for effective axes and check renderer capabilities.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedFace {
+    /// Platform-reported family name.
+    pub family: String,
+    /// Platform-reported PostScript face name; not necessarily a unique font file.
+    pub postscript_name: String,
+    /// Locator only; the consumer must read once and verify table witnesses.
+    pub path: std::path::PathBuf,
+    /// Original (non-synthetic) head/name/fvar bytes, including absent fvar.
+    /// Preparation only: never call this query from paint.
+    pub tables: Vec<([u8; 4], Option<Vec<u8>>)>,
+    /// Native effective axis identifiers (OpenType tags) and values.
+    pub variations: Vec<(u32, f64)>,
 }
 
 /// The configuration details for identifying a specific font.
