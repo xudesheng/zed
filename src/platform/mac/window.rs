@@ -1469,6 +1469,18 @@ impl PlatformWindow for MacWindow {
         self.0.as_ref().lock().toggle_tab_bar_callback = Some(callback);
     }
 
+    #[cfg(not(feature = "macos-blade"))]
+    fn prepare_isolated_layer(
+        &self,
+        window: crate::WindowId,
+        scale: f32,
+        size: Size<Pixels>,
+    ) -> Result<crate::PreparedIsolatedLayer, crate::IsolatedLayerError> {
+        self.0
+            .lock()
+            .renderer
+            .prepare_isolated_layer(window, scale, size)
+    }
     fn draw(&self, scene: &crate::Scene) {
         let mut this = self.0.lock();
         this.renderer.draw(scene);

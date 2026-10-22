@@ -32,6 +32,8 @@ pub(crate) struct Scene {
     pub(crate) monochrome_sprites: Vec<MonochromeSprite>,
     pub(crate) polychrome_sprites: Vec<PolychromeSprite>,
     pub(crate) surfaces: Vec<PaintSurface>,
+    #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+    pub(crate) isolated: Vec<IsolatedPrimitive>,
 }
 
 impl Scene {
@@ -46,6 +48,8 @@ impl Scene {
         self.monochrome_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+        self.isolated.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -105,6 +109,11 @@ impl Scene {
                 sprite.order = order;
                 self.polychrome_sprites.push(sprite.clone());
             }
+            #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+            Primitive::Isolated(layer) => {
+                layer.order = order;
+                self.isolated.push(layer.clone());
+            }
             Primitive::Surface(surface) => {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
@@ -134,6 +143,8 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
+        #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+        self.isolated.sort_by_key(|layer| layer.order);
     }
 
     #[cfg_attr(
@@ -163,6 +174,8 @@ impl Scene {
             polychrome_sprites: &self.polychrome_sprites,
             polychrome_sprites_start: 0,
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
+            #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+            isolated: self.isolated.iter().peekable(),
             surfaces: &self.surfaces,
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
@@ -187,6 +200,8 @@ pub(crate) enum PrimitiveKind {
     MonochromeSprite,
     PolychromeSprite,
     Surface,
+    #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+    Isolated,
 }
 
 pub(crate) enum PaintOperation {
@@ -204,6 +219,8 @@ pub(crate) enum Primitive {
     MonochromeSprite(MonochromeSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+    Isolated(IsolatedPrimitive),
 }
 
 impl Primitive {
@@ -216,6 +233,8 @@ impl Primitive {
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+            Primitive::Isolated(layer) => &layer.bounds,
         }
     }
 
@@ -228,6 +247,8 @@ impl Primitive {
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+            Primitive::Isolated(layer) => &layer.content_mask,
         }
     }
 }
@@ -240,6 +261,8 @@ impl Primitive {
     allow(dead_code)
 )]
 struct BatchIterator<'a> {
+    #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+    isolated: Peekable<slice::Iter<'a, IsolatedPrimitive>>,
     shadows: &'a [Shadow],
     shadows_start: usize,
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
@@ -268,6 +291,11 @@ impl<'a> Iterator for BatchIterator<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let mut orders_and_kinds = [
+            #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+            (
+                self.isolated.peek().map(|s| s.order),
+                PrimitiveKind::Isolated,
+            ),
             (
                 self.shadows_iter.peek().map(|s| s.order),
                 PrimitiveKind::Shadow,
@@ -302,6 +330,8 @@ impl<'a> Iterator for BatchIterator<'a> {
         };
 
         match batch_kind {
+            #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+            PrimitiveKind::Isolated => self.isolated.next().map(PrimitiveBatch::Isolated),
             PrimitiveKind::Shadow => {
                 let shadows_start = self.shadows_start;
                 let mut shadows_end = shadows_start + 1;
@@ -446,6 +476,8 @@ pub(crate) enum PrimitiveBatch<'a> {
         sprites: &'a [PolychromeSprite],
     },
     Surfaces(&'a [PaintSurface]),
+    #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+    Isolated(&'a IsolatedPrimitive),
 }
 
 #[derive(Default, Debug, Clone)]
@@ -828,6 +860,62 @@ impl PathVertex<Pixels> {
             xy_position: self.xy_position.scale(factor),
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+#[derive(Clone)]
+pub(crate) struct IsolatedPrimitive {
+    pub(crate) order: DrawOrder,
+    pub(crate) bounds: Bounds<ScaledPixels>,
+    pub(crate) content_mask: ContentMask<ScaledPixels>,
+    pub(crate) opacity: f32,
+    pub(crate) target: crate::PreparedIsolatedLayer,
+    pub(crate) scene: std::sync::Arc<Scene>,
+}
+#[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+impl std::fmt::Debug for IsolatedPrimitive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IsolatedPrimitive")
+            .field("bounds", &self.bounds)
+            .finish()
+    }
+}
+#[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
+impl Scene {
+    // Integer physical translation preserves glyph raster phases while all
+    // existing shaders, clips and path intermediates operate in local pixels.
+    pub(crate) fn translate_for_isolation(&mut self, origin: Point<ScaledPixels>) {
+        macro_rules! translate {
+            ($items:expr) => {
+                for item in $items {
+                    item.bounds.origin -= origin;
+                    item.content_mask.bounds.origin -= origin;
+                }
+            };
+        }
+        translate!(&mut self.quads);
+        translate!(&mut self.shadows);
+        translate!(&mut self.underlines);
+        translate!(&mut self.polychrome_sprites);
+        translate!(&mut self.surfaces);
+        translate!(&mut self.isolated);
+        for sprite in &mut self.monochrome_sprites {
+            sprite.bounds.origin -= origin;
+            sprite.content_mask.bounds.origin -= origin;
+            let m = &mut sprite.transformation;
+            let x = origin.x.0;
+            let y = origin.y.0;
+            m.translation[0] += m.rotation_scale[0][0] * x + m.rotation_scale[0][1] * y - x;
+            m.translation[1] += m.rotation_scale[1][0] * x + m.rotation_scale[1][1] * y - y;
+        }
+        for path in &mut self.paths {
+            path.bounds.origin -= origin;
+            path.content_mask.bounds.origin -= origin;
+            for vertex in &mut path.vertices {
+                vertex.xy_position -= origin;
+            }
         }
     }
 }

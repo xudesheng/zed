@@ -497,6 +497,14 @@ pub(crate) trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_hit_test_window_control(&self, callback: Box<dyn FnMut() -> Option<WindowControlArea>>);
     fn on_close(&self, callback: Box<dyn FnOnce()>);
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
+    fn prepare_isolated_layer(
+        &self,
+        _window: crate::WindowId,
+        _scale: f32,
+        _size: Size<Pixels>,
+    ) -> Result<crate::PreparedIsolatedLayer, crate::IsolatedLayerError> {
+        Err(crate::IsolatedLayerError::Unsupported)
+    }
     fn draw(&self, scene: &Scene);
     fn completed_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;

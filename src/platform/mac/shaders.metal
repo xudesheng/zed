@@ -1237,3 +1237,33 @@ float4 fill_color(Background background,
 
   return color;
 }
+
+struct IsolatedVertexOutput {
+  float4 position [[position]];
+  float2 uv;
+  float clip_distance [[clip_distance]][4];
+};
+struct IsolatedFragmentInput {
+  float4 position [[position]];
+  float2 uv;
+};
+vertex IsolatedVertexOutput isolated_vertex(
+  uint id [[vertex_id]], constant float2 *vertices [[buffer(0)]],
+  constant float4 *u [[buffer(1)]]) {
+  float2 uv = vertices[id];
+  float2 p = u[0].xy + uv * u[0].zw;
+  float2 screen = u[2].yz;
+  IsolatedVertexOutput out;
+  out.position = float4(p.x / screen.x * 2.0 - 1.0, 1.0 - p.y / screen.y * 2.0, 0.0, 1.0);
+  out.uv = uv;
+  out.clip_distance[0] = p.x - u[1].x;
+  out.clip_distance[1] = p.y - u[1].y;
+  out.clip_distance[2] = u[1].x + u[1].z - p.x;
+  out.clip_distance[3] = u[1].y + u[1].w - p.y;
+  return out;
+}
+fragment float4 isolated_fragment(IsolatedFragmentInput input [[stage_in]],
+  constant float4 *u [[buffer(1)]], texture2d<float> target [[texture(0)]]) {
+  constexpr sampler sample_target(mag_filter::nearest, min_filter::nearest);
+  return target.sample(sample_target, input.uv) * u[2].x;
+}
