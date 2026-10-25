@@ -2158,14 +2158,37 @@ impl DirectXRenderer {
 mod isolated_tests {
     use super::*;
     use crate::{ContentMask, ScaledPixels as S, rgba};
-    fn renderer() -> DirectXRenderer {
+    struct TestRenderer {
+        renderer: ManuallyDrop<DirectXRenderer>,
+        hwnd: HWND,
+    }
+    impl std::ops::Deref for TestRenderer {
+        type Target = DirectXRenderer;
+        fn deref(&self) -> &Self::Target {
+            &self.renderer
+        }
+    }
+    impl std::ops::DerefMut for TestRenderer {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.renderer
+        }
+    }
+    impl Drop for TestRenderer {
+        fn drop(&mut self) {
+            unsafe {
+                ManuallyDrop::drop(&mut self.renderer);
+                windows::Win32::UI::WindowsAndMessaging::DestroyWindow(self.hwnd).unwrap();
+            }
+        }
+    }
+    fn renderer() -> TestRenderer {
         use windows::{Win32::UI::WindowsAndMessaging::*, core::w};
         let hwnd = unsafe {
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
                 w!("STATIC"),
                 w!("GPUI native isolation readback"),
-                WS_OVERLAPPEDWINDOW,
+                WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                 0,
                 0,
                 64,
@@ -2182,7 +2205,10 @@ mod isolated_tests {
         renderer
             .resize(size(DevicePixels(16), DevicePixels(16)))
             .unwrap();
-        renderer
+        TestRenderer {
+            renderer: ManuallyDrop::new(renderer),
+            hwnd,
+        }
     }
     fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<S> {
         Bounds::new(point(S(x), S(y)), size(S(w), S(h)))
