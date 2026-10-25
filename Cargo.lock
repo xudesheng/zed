@@ -566,8 +566,7 @@ checksum = "6099cdc01846bc367c4e7dd630dc5966dccf36b652fae7a74e17b640411a91b2"
 [[package]]
 name = "blade-graphics"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4deb8f595ce7f00dee3543ebf6fd9a20ea86fc421ab79600dac30876250bdae"
+source = "git+https://github.com/xudesheng/blade?rev=241752f1a3fe8e27ea2430ecf1e822953f5526c9#241752f1a3fe8e27ea2430ecf1e822953f5526c9"
 dependencies = [
  "ash",
  "ash-window",
