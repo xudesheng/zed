@@ -253,6 +253,23 @@ impl PlatformTextSystem for DirectWriteTextSystem {
         self.0.read().glyph_for_char(font_id, ch)
     }
 
+    // Until a face is positively admitted as outline-only, use the shared
+    // prepared-line policy for unknown/bitmap technology: union the actual
+    // native allocation at every legal phase. Never use a guessed font box.
+    fn has_outline_only_bounds(&self, _font_id: FontId) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn glyph_bitmap_size(
+        &self,
+        _params: &RenderGlyphParams,
+        bounds: Bounds<DevicePixels>,
+    ) -> Result<Size<DevicePixels>> {
+        // This backend's rasterize_glyph returns exactly glyph_bounds.size;
+        // unlike CoreText, it adds no phase-dependent bitmap padding.
+        Ok(bounds.size)
+    }
+
     fn glyph_raster_bounds(
         &self,
         params: &RenderGlyphParams,

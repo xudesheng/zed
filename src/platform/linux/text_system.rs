@@ -168,6 +168,23 @@ impl PlatformTextSystem for CosmicTextSystem {
         self.0.read().glyph_for_char(font_id, ch)
     }
 
+    // Until a face is positively admitted as outline-only, use the shared
+    // prepared-line policy for unknown/bitmap technology: union the actual
+    // native allocation at every legal phase. Never use a guessed font box.
+    fn has_outline_only_bounds(&self, _font_id: FontId) -> Result<bool> {
+        Ok(false)
+    }
+
+    fn glyph_bitmap_size(
+        &self,
+        _params: &RenderGlyphParams,
+        bounds: Bounds<DevicePixels>,
+    ) -> Result<Size<DevicePixels>> {
+        // This backend's rasterize_glyph returns exactly glyph_bounds.size;
+        // unlike CoreText, it adds no phase-dependent bitmap padding.
+        Ok(bounds.size)
+    }
+
     fn glyph_raster_bounds(&self, params: &RenderGlyphParams) -> Result<Bounds<DevicePixels>> {
         self.0.write().raster_bounds(params)
     }
@@ -578,4 +595,41 @@ fn face_info_into_properties(
 fn check_is_known_emoji_font(postscript_name: &str) -> bool {
     // TODO: Include other common emoji fonts
     postscript_name == "NotoColorEmoji"
+}
+
+#[cfg(test)]
+mod prepared_allocation_tests {
+    use super::*;
+
+    // CPU text backend only: no X11/Wayland connection or window is needed.
+    #[test]
+    fn prepared_bitmap_sizes_match_native_allocations() {
+        let system = CosmicTextSystem::new();
+        let (font_id, glyph_id) = system
+            .all_font_names()
+            .into_iter()
+            .find_map(|name| {
+                let id = system.font_id(&crate::font(name)).ok()?;
+                Some((id, system.glyph_for_char(id, 'A')?))
+            })
+            .expect("an installed font covering ASCII");
+        assert!(!system.has_outline_only_bounds(font_id).unwrap());
+        for scale_factor in [1.0, 1.5, 2.0] {
+            for x in 0..SUBPIXEL_VARIANTS_X {
+                let params = RenderGlyphParams {
+                    font_id,
+                    glyph_id,
+                    font_size: crate::px(14.0),
+                    scale_factor,
+                    subpixel_variant: point(x, 0),
+                    is_emoji: false,
+                };
+                let bounds = system.glyph_raster_bounds(&params).unwrap();
+                let queried = system.glyph_bitmap_size(&params, bounds).unwrap();
+                let (actual, bitmap) = system.rasterize_glyph(&params, bounds).unwrap();
+                assert_eq!(queried, actual);
+                assert!(!bitmap.is_empty());
+            }
+        }
+    }
 }
