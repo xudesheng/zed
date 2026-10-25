@@ -368,6 +368,8 @@ pub struct BladeRenderer {
     isolated_pipelines: BladePipelines,
     isolated_depth: usize,
     #[cfg(not(target_os = "macos"))]
+    encoding_failed: bool,
+    #[cfg(not(target_os = "macos"))]
     isolated_pool: crate::isolated::TargetPool,
     #[cfg(not(target_os = "macos"))]
     retirement: std::sync::mpsc::Sender<IsolatedRetirement>,
@@ -468,6 +470,8 @@ impl BladeRenderer {
                 true,
             ),
             isolated_depth: 0,
+            #[cfg(not(target_os = "macos"))]
+            encoding_failed: false,
             #[cfg(not(target_os = "macos"))]
             isolated_pool: Default::default(),
             #[cfg(not(target_os = "macos"))]
@@ -716,6 +720,15 @@ impl BladeRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        #[cfg(not(target_os = "macos"))]
+        if self.encoding_failed {
+            let mut targets = Vec::new();
+            crate::isolated::collect_isolated_targets(scene, &mut targets);
+            for target in &targets {
+                target.fail();
+            }
+            return;
+        }
         #[cfg(target_os = "macos")]
         self.command_encoder.start();
         #[cfg(not(target_os = "macos"))]
@@ -726,6 +739,10 @@ impl BladeRenderer {
                 target.fail();
             }
             log::error!("native encoding start failed: {error}");
+            self.encoding_failed = true;
+            // The previous receipt can still be in flight. A failed start must
+            // not let the next frame rotate/reset its live command buffer.
+            self.wait_for_gpu();
             return;
         }
         self.atlas.before_frame(&mut self.command_encoder);
@@ -782,6 +799,11 @@ impl BladeRenderer {
                         target.fail();
                     }
                     log::error!("native submission failed: {error}");
+                    self.encoding_failed = true;
+                    // No receipt exists for this frame. Retire the last valid
+                    // one before any teardown. Unsubmitted atlas uploads and
+                    // encoder state are unusable until this renderer is rebuilt.
+                    self.wait_for_gpu();
                     return;
                 }
             }
@@ -1306,6 +1328,9 @@ impl BladeRenderer {
         logical: Size<crate::Pixels>,
     ) -> Result<crate::PreparedIsolatedLayer, crate::IsolatedLayerError> {
         use crate::IsolatedLayerError as E;
+        if self.encoding_failed {
+            return Err(E::Device);
+        }
         let pixel_size = crate::isolated::target_pixel_size(logical, scale)?;
         let prepare = |samples| {
             self.gpu.prepare_native_image(gpu::TextureDesc {
