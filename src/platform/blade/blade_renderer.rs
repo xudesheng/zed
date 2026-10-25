@@ -131,10 +131,19 @@ struct BladePipelines {
     mono_sprites: gpu::RenderPipeline,
     poly_sprites: gpu::RenderPipeline,
     surfaces: gpu::RenderPipeline,
+    isolated: gpu::RenderPipeline,
 }
 
 impl BladePipelines {
     fn new(gpu: &gpu::Context, surface_info: gpu::SurfaceInfo, path_sample_count: u32) -> Self {
+        Self::create(gpu, surface_info, path_sample_count, false)
+    }
+    fn create(
+        gpu: &gpu::Context,
+        surface_info: gpu::SurfaceInfo,
+        path_sample_count: u32,
+        isolated: bool,
+    ) -> Self {
         use gpu::ShaderData as _;
 
         log::info!(
@@ -167,6 +176,24 @@ impl BladePipelines {
         }];
 
         Self {
+            isolated: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
+                name: "isolated composite",
+                data_layouts: &[&ShaderIsolatedData::layout()],
+                vertex: shader.at("vs_isolated"),
+                vertex_fetches: &[],
+                primitive: gpu::PrimitiveState {
+                    topology: gpu::PrimitiveTopology::TriangleStrip,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                fragment: Some(shader.at("fs_isolated")),
+                color_targets: &[gpu::ColorTargetState {
+                    format: surface_info.format,
+                    blend: Some(gpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: gpu::ColorWrites::default(),
+                }],
+                multisample_state: gpu::MultisampleState::default(),
+            }),
             quads: gpu.create_render_pipeline(gpu::RenderPipelineDesc {
                 name: "quads",
                 data_layouts: &[&ShaderQuadsData::layout()],
@@ -238,7 +265,11 @@ impl BladePipelines {
                     format: surface_info.format,
                     blend: Some(gpu::BlendState {
                         color: gpu::BlendComponent::OVER,
-                        alpha: gpu::BlendComponent::ADDITIVE,
+                        alpha: if isolated {
+                            gpu::BlendComponent::OVER
+                        } else {
+                            gpu::BlendComponent::ADDITIVE
+                        },
                     }),
                     write_mask: gpu::ColorWrites::default(),
                 }],
@@ -312,6 +343,7 @@ impl BladePipelines {
         gpu.destroy_render_pipeline(&mut self.mono_sprites);
         gpu.destroy_render_pipeline(&mut self.poly_sprites);
         gpu.destroy_render_pipeline(&mut self.surfaces);
+        gpu.destroy_render_pipeline(&mut self.isolated);
     }
 }
 
@@ -331,6 +363,13 @@ pub struct BladeRenderer {
     command_encoder: gpu::CommandEncoder,
     last_sync_point: Option<gpu::SyncPoint>,
     pipelines: BladePipelines,
+    #[cfg(not(target_os = "macos"))]
+    isolated_pipelines: BladePipelines,
+    isolated_depth: usize,
+    #[cfg(not(target_os = "macos"))]
+    isolated_pool: crate::isolated::TargetPool,
+    #[cfg(not(target_os = "macos"))]
+    retirement: std::sync::mpsc::Sender<IsolatedRetirement>,
     instance_belt: BufferBelt,
     atlas: Arc<BladeAtlas>,
     atlas_sampler: gpu::Sampler,
@@ -417,6 +456,21 @@ impl BladeRenderer {
             command_encoder,
             last_sync_point: None,
             pipelines,
+            #[cfg(not(target_os = "macos"))]
+            isolated_pipelines: BladePipelines::create(
+                &context.gpu,
+                gpu::SurfaceInfo {
+                    format: gpu::TextureFormat::Bgra8Unorm,
+                    alpha: gpu::AlphaMode::PreMultiplied,
+                },
+                rendering_parameters.path_sample_count,
+                true,
+            ),
+            isolated_depth: 0,
+            #[cfg(not(target_os = "macos"))]
+            isolated_pool: Default::default(),
+            #[cfg(not(target_os = "macos"))]
+            retirement: start_isolated_retirement(context.gpu.clone())?,
             instance_belt,
             atlas,
             atlas_sampler,
@@ -430,6 +484,23 @@ impl BladeRenderer {
         })
     }
 
+    #[cfg(not(target_os = "macos"))]
+    fn wait_for_gpu(&mut self) {
+        if let Some(sync) = self.last_sync_point.take() {
+            loop {
+                match self.gpu.try_wait_native(&sync, MAX_FRAME_TIME_MS) {
+                    Ok(true) => break,
+                    Ok(false) => continue,
+                    Err(error) if error.is_device_lost() => break,
+                    Err(error) => {
+                        log::error!("waiting for GPU: {error}");
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
     fn wait_for_gpu(&mut self) {
         if let Some(last_sp) = self.last_sync_point.take()
             && !self.gpu.wait_for(&last_sp, MAX_FRAME_TIME_MS)
@@ -518,6 +589,7 @@ impl BladeRenderer {
             self.gpu
                 .reconfigure_surface(&mut self.surface, self.surface_config);
             self.pipelines.destroy(&self.gpu);
+
             self.pipelines = BladePipelines::new(
                 &self.gpu,
                 self.surface.info(),
@@ -628,6 +700,8 @@ impl BladeRenderer {
         self.instance_belt.destroy(&self.gpu);
         self.gpu.destroy_command_encoder(&mut self.command_encoder);
         self.pipelines.destroy(&self.gpu);
+        #[cfg(not(target_os = "macos"))]
+        self.isolated_pipelines.destroy(&self.gpu);
         self.gpu.destroy_surface(&mut self.surface);
         self.gpu.destroy_texture(self.path_intermediate_texture);
         self.gpu
@@ -641,7 +715,18 @@ impl BladeRenderer {
     }
 
     pub fn draw(&mut self, scene: &Scene) {
+        #[cfg(target_os = "macos")]
         self.command_encoder.start();
+        #[cfg(not(target_os = "macos"))]
+        if let Err(error) = self.command_encoder.try_start_native() {
+            let mut targets = Vec::new();
+            crate::isolated::collect_isolated_targets(scene, &mut targets);
+            for target in &targets {
+                target.fail();
+            }
+            log::error!("native encoding start failed: {error}");
+            return;
+        }
         self.atlas.before_frame(&mut self.command_encoder);
 
         let frame = {
@@ -662,11 +747,58 @@ impl BladeRenderer {
             pad: 0,
         };
 
+        self.draw_scene(scene, frame.texture_view(), globals);
+
+        self.command_encoder.present(frame);
+        #[cfg(target_os = "macos")]
+        let sync_point = self.gpu.submit(&mut self.command_encoder);
+        #[cfg(not(target_os = "macos"))]
+        let sync_point = {
+            let mut targets = Vec::new();
+            crate::isolated::collect_isolated_targets(scene, &mut targets);
+            match self.gpu.try_submit_native(&mut self.command_encoder) {
+                Ok(receipt) => {
+                    if receipt.presentation_error.is_some() {
+                        for target in &targets {
+                            target.fail();
+                        }
+                    }
+                    if !targets.is_empty() {
+                        if let Err(error) = self.retirement.send(IsolatedRetirement {
+                            sync: receipt.sync_point.clone(),
+                            targets,
+                        }) {
+                            for target in &error.0.targets {
+                                target.fail();
+                            }
+                            std::mem::forget(error.0); // Observer loss is not proof of retirement.
+                        }
+                    }
+                    receipt.sync_point
+                }
+                Err(error) => {
+                    for target in &targets {
+                        target.fail();
+                    }
+                    log::error!("native submission failed: {error}");
+                    return;
+                }
+            }
+        };
+
+        profiling::scope!("finish");
+        self.instance_belt.flush(&sync_point);
+        self.atlas.after_frame(&sync_point);
+
+        self.wait_for_gpu();
+        self.last_sync_point = Some(sync_point);
+    }
+    fn draw_scene(&mut self, scene: &Scene, view: gpu::TextureView, globals: GlobalParams) {
         let mut pass = self.command_encoder.render(
             "main",
             gpu::RenderTargetSet {
                 colors: &[gpu::RenderTarget {
-                    view: frame.texture_view(),
+                    view: view,
                     init_op: gpu::InitOp::Clear(gpu::TextureColor::TransparentBlack),
                     finish_op: gpu::FinishOp::Store,
                 }],
@@ -677,6 +809,47 @@ impl BladeRenderer {
         profiling::scope!("render pass");
         for batch in scene.batches() {
             match batch {
+                PrimitiveBatch::Isolated(layer) => {
+                    drop(pass);
+                    #[cfg(not(target_os = "macos"))]
+                    self.draw_isolated(layer);
+                    #[cfg(target_os = "macos")]
+                    layer.target.fail();
+                    pass = self.command_encoder.render(
+                        "resume parent",
+                        gpu::RenderTargetSet {
+                            colors: &[gpu::RenderTarget {
+                                view,
+                                init_op: gpu::InitOp::Load,
+                                finish_op: gpu::FinishOp::Store,
+                            }],
+                            depth_stencil: None,
+                        },
+                    );
+                    if !layer.target.is_failed() {
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            let mut encoder = pass.with(&self.pipelines.isolated);
+                            encoder.bind(
+                                0,
+                                &ShaderIsolatedData {
+                                    globals,
+                                    isolated_locals: IsolatedParams {
+                                        bounds: layer.bounds.into(),
+                                        content_mask: layer.content_mask.bounds.into(),
+                                        opacity: layer.opacity,
+                                        pad0: 0.,
+                                        pad1: 0.,
+                                        pad2: 0.,
+                                    },
+                                    t_isolated: layer.target.blade.color.view(),
+                                    s_sprite: self.atlas_sampler,
+                                },
+                            );
+                            encoder.draw(0, 4, 0, 1);
+                        }
+                    }
+                }
                 PrimitiveBatch::Quads(quads) => {
                     let instance_buf = unsafe { self.instance_belt.alloc_typed(quads, &self.gpu) };
                     let mut encoder = pass.with(&self.pipelines.quads);
@@ -709,14 +882,14 @@ impl BladeRenderer {
                     drop(pass);
                     self.draw_paths_to_intermediate(
                         paths,
-                        self.surface_config.size.width as f32,
-                        self.surface_config.size.height as f32,
+                        globals.viewport_size[0],
+                        globals.viewport_size[1],
                     );
                     pass = self.command_encoder.render(
                         "main",
                         gpu::RenderTargetSet {
                             colors: &[gpu::RenderTarget {
-                                view: frame.texture_view(),
+                                view: view,
                                 init_op: gpu::InitOp::Load,
                                 finish_op: gpu::FinishOp::Store,
                             }],
@@ -905,16 +1078,6 @@ impl BladeRenderer {
             }
         }
         drop(pass);
-
-        self.command_encoder.present(frame);
-        let sync_point = self.gpu.submit(&mut self.command_encoder);
-
-        profiling::scope!("finish");
-        self.instance_belt.flush(&sync_point);
-        self.atlas.after_frame(&sync_point);
-
-        self.wait_for_gpu();
-        self.last_sync_point = Some(sync_point);
     }
 }
 
@@ -1068,5 +1231,219 @@ impl RenderingParameters {
             ratios[2] * NORM13,
             ratios[3] * NORM24,
         ]
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct IsolatedParams {
+    bounds: PodBounds,
+    content_mask: PodBounds,
+    opacity: f32,
+    pad0: f32,
+    pad1: f32,
+    pad2: f32,
+}
+#[derive(blade_macros::ShaderData)]
+struct ShaderIsolatedData {
+    globals: GlobalParams,
+    isolated_locals: IsolatedParams,
+    t_isolated: gpu::TextureView,
+    s_sprite: gpu::Sampler,
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) struct IsolatedTextures {
+    gpu: Arc<gpu::Context>,
+    color: gpu::NativeImageView,
+    paths: gpu::NativeImageView,
+    msaa: Option<gpu::NativeImageView>,
+    initialized: std::sync::atomic::AtomicBool,
+    _reservation: crate::isolated::TargetReservation,
+}
+#[cfg(not(target_os = "macos"))]
+struct IsolatedRetirement {
+    sync: gpu::SyncPoint,
+    targets: Vec<crate::PreparedIsolatedLayer>,
+}
+#[cfg(not(target_os = "macos"))]
+fn start_isolated_retirement(
+    gpu: Arc<gpu::Context>,
+) -> std::io::Result<std::sync::mpsc::Sender<IsolatedRetirement>> {
+    let (sender, receiver) = std::sync::mpsc::channel::<IsolatedRetirement>();
+    std::thread::Builder::new()
+        .name("gpui-vulkan-retirement".into())
+        .spawn(move || {
+            for receipt in receiver {
+                loop {
+                    match gpu.try_wait_native(&receipt.sync, 10) {
+                        Ok(true) => break,
+                        Ok(false) => {} // Timeout is pending, including after window close.
+                        Err(error) => {
+                            for target in &receipt.targets {
+                                target.fail();
+                            }
+                            if error.is_device_lost() {
+                                break;
+                            }
+                            // An observer error does not prove retirement. Keep all
+                            // leases and retry; late subscribers still see failure.
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                }
+            }
+        })?;
+    Ok(sender)
+}
+#[cfg(not(target_os = "macos"))]
+impl BladeRenderer {
+    pub(crate) fn prepare_isolated_layer(
+        &self,
+        window: crate::WindowId,
+        scale: f32,
+        logical: Size<crate::Pixels>,
+    ) -> Result<crate::PreparedIsolatedLayer, crate::IsolatedLayerError> {
+        use crate::IsolatedLayerError as E;
+        let pixel_size = crate::isolated::target_pixel_size(logical, scale)?;
+        let prepare = |samples| {
+            self.gpu.prepare_native_image(gpu::TextureDesc {
+                name: "isolated",
+                format: gpu::TextureFormat::Bgra8Unorm,
+                size: gpu::Extent {
+                    width: pixel_size.width,
+                    height: pixel_size.height,
+                    depth: 1,
+                },
+                array_layer_count: 1,
+                mip_level_count: 1,
+                sample_count: samples,
+                dimension: gpu::TextureDimension::D2,
+                usage: gpu::TextureUsage::TARGET | gpu::TextureUsage::RESOURCE,
+                external: None,
+            })
+        };
+        let prepare_all = || -> Result<_, gpu::NativeError> {
+            Ok((
+                prepare(1)?,
+                prepare(1)?,
+                if self.rendering_parameters.path_sample_count > 1 {
+                    Some(prepare(self.rendering_parameters.path_sample_count)?)
+                } else {
+                    None
+                },
+            ))
+        };
+        let (color, paths, msaa) = prepare_all().map_err(|e| {
+            log::error!("querying isolated Vulkan images: {e}");
+            E::Device
+        })?;
+        let mut bytes = color
+            .reservation_bytes()
+            .map_err(|_| E::Limit)?
+            .checked_add(paths.reservation_bytes().map_err(|_| E::Limit)?)
+            .ok_or(E::Limit)?;
+        if let Some(plan) = &msaa {
+            bytes = bytes
+                .checked_add(plan.reservation_bytes().map_err(|_| E::Limit)?)
+                .ok_or(E::Limit)?;
+        }
+        let floor = u64::from(pixel_size.width) * u64::from(pixel_size.height) * 24;
+        let reservation = self
+            .isolated_pool
+            .reserve(usize::try_from(bytes.max(floor)).map_err(|_| E::Limit)?)?;
+        // All native requirements were queried and reserved before the first
+        // dedicated allocation or bind. RAII rolls back every partial failure.
+        let allocate = || -> Result<_, gpu::NativeError> {
+            Ok((
+                color.allocate()?.create_view()?,
+                paths.allocate()?.create_view()?,
+                msaa.map(|p| p.allocate()?.create_view()).transpose()?,
+            ))
+        };
+        let (color, paths, msaa) = allocate().map_err(|e| {
+            log::error!("allocating isolated Vulkan images: {e}");
+            E::Device
+        })?;
+        Ok(crate::PreparedIsolatedLayer {
+            window,
+            scale,
+            size: logical,
+            pixel_size,
+            failure: Arc::new(Default::default()),
+            recording: Arc::new(Default::default()),
+            blade: Arc::new(IsolatedTextures {
+                gpu: self.gpu.clone(),
+                color,
+                paths,
+                msaa,
+                initialized: Default::default(),
+                _reservation: reservation,
+            }),
+        })
+    }
+    fn draw_isolated(&mut self, layer: &crate::IsolatedPrimitive) {
+        if layer.target.is_failed() {
+            return;
+        }
+        let target = &layer.target.blade;
+        if !Arc::ptr_eq(&target.gpu, &self.gpu) {
+            layer.target.fail();
+            return;
+        }
+        if !target
+            .initialized
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.command_encoder.init_texture(target.color.texture());
+            self.command_encoder.init_texture(target.paths.texture());
+            if let Some(msaa) = &target.msaa {
+                self.command_encoder.init_texture(msaa.texture());
+            }
+        }
+        let old_paths =
+            std::mem::replace(&mut self.path_intermediate_texture, target.paths.texture());
+        let old_view = std::mem::replace(
+            &mut self.path_intermediate_texture_view,
+            target.paths.view(),
+        );
+        let old_msaa = std::mem::replace(
+            &mut self.path_intermediate_msaa_texture,
+            target.msaa.as_ref().map(|v| v.texture()),
+        );
+        let old_msaa_view = std::mem::replace(
+            &mut self.path_intermediate_msaa_texture_view,
+            target.msaa.as_ref().map(|v| v.view()),
+        );
+        if self.isolated_depth == 0 {
+            std::mem::swap(&mut self.pipelines, &mut self.isolated_pipelines);
+        }
+        self.isolated_depth += 1;
+        let encoded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.draw_scene(
+                &layer.scene,
+                target.color.view(),
+                GlobalParams {
+                    viewport_size: [
+                        layer.target.pixel_size.width as f32,
+                        layer.target.pixel_size.height as f32,
+                    ],
+                    premultiplied_alpha: 1,
+                    pad: 0,
+                },
+            );
+        }));
+        self.isolated_depth -= 1;
+        if self.isolated_depth == 0 {
+            std::mem::swap(&mut self.pipelines, &mut self.isolated_pipelines);
+        }
+        self.path_intermediate_texture = old_paths;
+        self.path_intermediate_texture_view = old_view;
+        self.path_intermediate_msaa_texture = old_msaa;
+        self.path_intermediate_msaa_texture_view = old_msaa_view;
+        if encoded.is_err() {
+            layer.target.fail();
+            log::error!("isolated Vulkan encoding failed");
+        }
     }
 }

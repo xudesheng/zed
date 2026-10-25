@@ -845,6 +845,18 @@ impl PlatformWindow for WindowsWindow {
         self.0.state.borrow_mut().renderer.draw(scene).log_err();
     }
 
+    fn prepare_isolated_layer(
+        &self,
+        window: crate::WindowId,
+        scale: f32,
+        size: Size<Pixels>,
+    ) -> std::result::Result<crate::PreparedIsolatedLayer, crate::IsolatedLayerError> {
+        self.state
+            .borrow()
+            .renderer
+            .prepare_isolated_layer(window, scale, size)
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.state.borrow().renderer.sprite_atlas()
     }

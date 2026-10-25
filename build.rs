@@ -292,6 +292,7 @@ mod windows {
             "shadow",
             "path_rasterization",
             "path_sprite",
+            "isolated",
             "underline",
             "monochrome_sprite",
             "polychrome_sprite",

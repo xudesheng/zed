@@ -1475,6 +1475,18 @@ impl PlatformWindow for X11Window {
         inner.renderer.draw(scene);
     }
 
+    fn prepare_isolated_layer(
+        &self,
+        window: crate::WindowId,
+        scale: f32,
+        size: Size<Pixels>,
+    ) -> std::result::Result<crate::PreparedIsolatedLayer, crate::IsolatedLayerError> {
+        self.0
+            .state
+            .borrow()
+            .renderer
+            .prepare_isolated_layer(window, scale, size)
+    }
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         let inner = self.0.state.borrow();
         inner.renderer.sprite_atlas().clone()

@@ -37,10 +37,15 @@ pub struct PreparedIsolatedLayer {
     pub(crate) window: WindowId,
     pub(crate) scale: f32,
     pub(crate) size: Size<Pixels>,
+    pub(crate) pixel_size: Size<u32>,
     pub(crate) failure: Arc<FailureSignal>,
     pub(crate) recording: Arc<AtomicBool>,
     #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
     pub(crate) metal: Arc<crate::metal_renderer::IsolatedTextures>,
+    #[cfg(target_os = "windows")]
+    pub(crate) directx: Arc<crate::platform::windows::IsolatedTextures>,
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    pub(crate) blade: Arc<crate::platform::blade::IsolatedTextures>,
 }
 impl std::fmt::Debug for PreparedIsolatedLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -149,7 +154,6 @@ impl Window {
         {
             return Err(IsolatedLayerError::Invalid);
         }
-        #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
         {
             // Reusing the target in separate placements is supported, but a
             // target cannot be sampled while it is also an ancestor attachment.
@@ -182,10 +186,7 @@ impl Window {
                         order: 0,
                         bounds: Bounds {
                             origin,
-                            size: target
-                                .metal
-                                .pixel_size
-                                .map(|v| crate::ScaledPixels(v as f32)),
+                            size: target.pixel_size.map(|v| crate::ScaledPixels(v as f32)),
                         },
                         content_mask: mask.scale(target.scale),
                         opacity: opacity * old_opacity,
@@ -202,11 +203,6 @@ impl Window {
                     Ok(Ok(()))
                 }
             }
-        }
-        #[cfg(not(all(target_os = "macos", not(feature = "macos-blade"))))]
-        {
-            let _ = paint;
-            Err(IsolatedLayerError::Unsupported)
         }
     }
 }
@@ -288,4 +284,31 @@ mod notification_tests {
             signal.fail(); // idempotent
         });
     }
+}
+
+// A single recursive walk retains nested targets as well as siblings through
+// actual native completion, independently of window/Scene ownership.
+pub(crate) fn collect_isolated_targets(scene: &crate::Scene, out: &mut Vec<PreparedIsolatedLayer>) {
+    for layer in &scene.isolated {
+        out.push(layer.target.clone());
+        collect_isolated_targets(&layer.scene, out);
+    }
+}
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn target_pixel_size(
+    logical: Size<Pixels>,
+    scale: f32,
+) -> Result<Size<u32>, IsolatedLayerError> {
+    let dimension = |n: Pixels| {
+        let n = (f32::from(n) * scale).ceil() + 1.;
+        if !n.is_finite() || n < 1. || n > 16384. {
+            Err(IsolatedLayerError::Limit)
+        } else {
+            Ok(n as u32)
+        }
+    };
+    Ok(crate::size(
+        dimension(logical.width)?,
+        dimension(logical.height)?,
+    ))
 }

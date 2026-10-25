@@ -15,13 +15,13 @@ mod mac;
     ),
     all(target_os = "macos", feature = "macos-blade")
 ))]
-mod blade;
+pub(crate) mod blade;
 
 #[cfg(any(test, feature = "test-support"))]
 mod test;
 
 #[cfg(target_os = "windows")]
-mod windows;
+pub(crate) mod windows;
 
 #[cfg(all(
     feature = "screen-capture",

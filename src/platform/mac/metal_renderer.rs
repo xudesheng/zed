@@ -1611,12 +1611,7 @@ fn retain_isolated_resources(scene: &Scene, command_buffer: &metal::CommandBuffe
     .copy();
     command_buffer.add_completed_handler(&completed);
 }
-fn collect_isolated_targets(scene: &Scene, out: &mut Vec<crate::PreparedIsolatedLayer>) {
-    for layer in &scene.isolated {
-        out.push(layer.target.clone());
-        collect_isolated_targets(&layer.scene, out);
-    }
-}
+use crate::isolated::collect_isolated_targets;
 impl MetalRenderer {
     pub(crate) fn prepare_isolated_layer(
         &self,
@@ -1692,6 +1687,7 @@ impl MetalRenderer {
             window,
             scale,
             size: logical,
+            pixel_size,
             failure: Arc::new(crate::isolated::FailureSignal::default()),
             recording: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             metal: Arc::new(IsolatedTextures {

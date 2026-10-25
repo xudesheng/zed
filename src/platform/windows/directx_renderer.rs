@@ -45,6 +45,10 @@ pub(crate) struct DirectXRenderer {
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
     font_info: &'static FontInfo,
+    isolated_pool: crate::isolated::TargetPool,
+    isolated_depth: usize,
+    isolated_pipelines: DirectXRenderPipelines,
+    retirement: std::sync::mpsc::Sender<IsolatedRetirement>,
 }
 
 /// Direct3D objects
@@ -83,6 +87,7 @@ struct DirectXRenderPipelines {
     underline_pipeline: PipelineState<Underline>,
     mono_sprites: PipelineState<MonochromeSprite>,
     poly_sprites: PipelineState<PolychromeSprite>,
+    isolated: PipelineState<IsolatedSprite>,
 }
 
 struct DirectXGlobalElements {
@@ -107,6 +112,11 @@ impl DirectXRendererDevices {
             device,
             device_context,
         } = directx_devices;
+        unsafe {
+            device_context
+                .cast::<ID3D11Multithread>()?
+                .SetMultithreadProtected(true);
+        }
         let dxgi_device = if disable_direct_composition {
             None
         } else {
@@ -164,6 +174,13 @@ impl DirectXRenderer {
             pipelines,
             direct_composition,
             font_info: Self::get_font_info(),
+            isolated_pool: Default::default(),
+            isolated_depth: 0,
+            isolated_pipelines: DirectXRenderPipelines::new_isolated(&directx_devices.device)?,
+            retirement: start_isolated_retirement(
+                &directx_devices.device,
+                &directx_devices.device_context,
+            )?,
         })
     }
 
@@ -273,6 +290,9 @@ impl DirectXRenderer {
         self.resources = resources;
         self.globals = globals;
         self.pipelines = pipelines;
+        self.isolated_pipelines = DirectXRenderPipelines::new_isolated(&directx_devices.device)?;
+        self.retirement =
+            start_isolated_retirement(&directx_devices.device, &directx_devices.device_context)?;
         self.direct_composition = direct_composition;
 
         unsafe {
@@ -284,7 +304,49 @@ impl DirectXRenderer {
     }
 
     pub(crate) fn draw(&mut self, scene: &Scene) -> Result<()> {
-        self.pre_draw()?;
+        let mut targets = Vec::new();
+        crate::isolated::collect_isolated_targets(scene, &mut targets);
+        // Query allocation is fallible and precedes all layer commands.
+        let query = if targets.is_empty() {
+            None
+        } else {
+            let mut query = None;
+            unsafe {
+                self.devices.device.CreateQuery(
+                    &D3D11_QUERY_DESC {
+                        Query: D3D11_QUERY_EVENT,
+                        MiscFlags: 0,
+                    },
+                    Some(&mut query),
+                )?;
+            }
+            query
+        };
+        let result = self.pre_draw().and_then(|_| self.draw_batches(scene));
+        if let Some(query) = query {
+            if result.is_err() {
+                for target in &targets {
+                    target.fail();
+                }
+            }
+            unsafe {
+                self.devices.device_context.End(&query);
+                self.devices.device_context.Flush();
+            }
+            if let Err(error) = self.retirement.send(IsolatedRetirement { query, targets }) {
+                // A dead observer is terminal, but is not proof of GPU retirement.
+                for target in &error.0.targets {
+                    target.fail();
+                }
+                std::mem::forget(error.0);
+                return Err(anyhow::anyhow!("isolated retirement observer stopped"));
+            }
+        }
+        result?;
+        self.present()
+    }
+
+    fn draw_batches(&mut self, scene: &Scene) -> Result<()> {
         for batch in scene.batches() {
             match batch {
                 PrimitiveBatch::Shadows(shadows) => self.draw_shadows(shadows),
@@ -303,6 +365,7 @@ impl DirectXRenderer {
                     sprites,
                 } => self.draw_polychrome_sprites(texture_id, sprites),
                 PrimitiveBatch::Surfaces(surfaces) => self.draw_surfaces(surfaces),
+                PrimitiveBatch::Isolated(layer) => self.draw_isolated(layer),
             }.context(format!("scene too large: {} paths, {} shadows, {} quads, {} underlines, {} mono, {} poly, {} surfaces",
                     scene.paths.len(),
                     scene.shadows.len(),
@@ -312,7 +375,7 @@ impl DirectXRenderer {
                     scene.polychrome_sprites.len(),
                     scene.surfaces.len(),))?;
         }
-        self.present()
+        Ok(())
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
@@ -725,19 +788,39 @@ impl DirectXResources {
 
 impl DirectXRenderPipelines {
     pub fn new(device: &ID3D11Device) -> Result<Self> {
+        Self::create(device, false)
+    }
+    fn new_isolated(device: &ID3D11Device) -> Result<Self> {
+        Self::create(device, true)
+    }
+    fn create(device: &ID3D11Device, isolated: bool) -> Result<Self> {
+        let ordinary_blend = || {
+            if isolated {
+                isolated_blend_state(device, false)
+            } else {
+                create_blend_state(device)
+            }
+        };
+        let path_blend = || {
+            if isolated {
+                isolated_blend_state(device, true)
+            } else {
+                create_blend_state_for_path_sprite(device)
+            }
+        };
         let shadow_pipeline = PipelineState::new(
             device,
             "shadow_pipeline",
             ShaderModule::Shadow,
             4,
-            create_blend_state(device)?,
+            ordinary_blend()?,
         )?;
         let quad_pipeline = PipelineState::new(
             device,
             "quad_pipeline",
             ShaderModule::Quad,
             64,
-            create_blend_state(device)?,
+            ordinary_blend()?,
         )?;
         let path_rasterization_pipeline = PipelineState::new(
             device,
@@ -751,28 +834,28 @@ impl DirectXRenderPipelines {
             "path_sprite_pipeline",
             ShaderModule::PathSprite,
             4,
-            create_blend_state_for_path_sprite(device)?,
+            path_blend()?,
         )?;
         let underline_pipeline = PipelineState::new(
             device,
             "underline_pipeline",
             ShaderModule::Underline,
             4,
-            create_blend_state(device)?,
+            ordinary_blend()?,
         )?;
         let mono_sprites = PipelineState::new(
             device,
             "monochrome_sprite_pipeline",
             ShaderModule::MonochromeSprite,
             512,
-            create_blend_state(device)?,
+            ordinary_blend()?,
         )?;
         let poly_sprites = PipelineState::new(
             device,
             "polychrome_sprite_pipeline",
             ShaderModule::PolychromeSprite,
             16,
-            create_blend_state(device)?,
+            ordinary_blend()?,
         )?;
 
         Ok(Self {
@@ -783,6 +866,13 @@ impl DirectXRenderPipelines {
             underline_pipeline,
             mono_sprites,
             poly_sprites,
+            isolated: PipelineState::new(
+                device,
+                "isolated",
+                ShaderModule::Isolated,
+                1,
+                isolated_blend_state(device, true)?,
+            )?,
         })
     }
 }
@@ -1407,6 +1497,7 @@ pub(crate) mod shader_resources {
         Underline,
         PathRasterization,
         PathSprite,
+        Isolated,
         MonochromeSprite,
         PolychromeSprite,
         EmojiRasterization,
@@ -1466,6 +1557,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PathRasterization => match target {
                     ShaderTarget::Vertex => PATH_RASTERIZATION_VERTEX_BYTES,
                     ShaderTarget::Fragment => PATH_RASTERIZATION_FRAGMENT_BYTES,
+                },
+                ShaderModule::Isolated => match target {
+                    ShaderTarget::Vertex => ISOLATED_VERTEX_BYTES,
+                    ShaderTarget::Fragment => ISOLATED_FRAGMENT_BYTES,
                 },
                 ShaderModule::PathSprite => match target {
                     ShaderTarget::Vertex => PATH_SPRITE_VERTEX_BYTES,
@@ -1566,6 +1661,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::Underline => "underline",
                 ShaderModule::PathRasterization => "path_rasterization",
                 ShaderModule::PathSprite => "path_sprite",
+                ShaderModule::Isolated => "isolated",
                 ShaderModule::MonochromeSprite => "monochrome_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
@@ -1754,5 +1850,582 @@ mod dxgi {
             (number >> 16) & 0xFFFF,
             number & 0xFFFF
         ))
+    }
+}
+
+// D3D11 has no committed-allocation size query. Charge declared logical native
+// attachment storage before CreateTexture2D: BGRA8 colour + resolve + 4x MSAA,
+// retaining the accepted 24-byte/physical-pixel minimum.
+pub(crate) struct IsolatedTextures {
+    device: ID3D11Device,
+    color: ID3D11Texture2D,
+    color_view: [Option<ID3D11RenderTargetView>; 1],
+    color_srv: [Option<ID3D11ShaderResourceView>; 1],
+    paths: ID3D11Texture2D,
+    paths_srv: [Option<ID3D11ShaderResourceView>; 1],
+    msaa: ID3D11Texture2D,
+    msaa_view: [Option<ID3D11RenderTargetView>; 1],
+    viewport: [D3D11_VIEWPORT; 1],
+    _reservation: crate::isolated::TargetReservation,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct IsolatedSprite {
+    bounds: Bounds<ScaledPixels>,
+    content_mask: Bounds<ScaledPixels>,
+    opacity: f32,
+    pad: [f32; 3],
+}
+fn isolated_blend_state(device: &ID3D11Device, premultiplied: bool) -> Result<ID3D11BlendState> {
+    let mut desc = D3D11_BLEND_DESC::default();
+    desc.RenderTarget[0] = D3D11_RENDER_TARGET_BLEND_DESC {
+        BlendEnable: true.into(),
+        SrcBlend: if premultiplied {
+            D3D11_BLEND_ONE
+        } else {
+            D3D11_BLEND_SRC_ALPHA
+        },
+        DestBlend: D3D11_BLEND_INV_SRC_ALPHA,
+        BlendOp: D3D11_BLEND_OP_ADD,
+        SrcBlendAlpha: D3D11_BLEND_ONE,
+        DestBlendAlpha: D3D11_BLEND_INV_SRC_ALPHA,
+        BlendOpAlpha: D3D11_BLEND_OP_ADD,
+        RenderTargetWriteMask: D3D11_COLOR_WRITE_ENABLE_ALL.0 as u8,
+    };
+    let mut state = None;
+    unsafe {
+        device.CreateBlendState(&desc, Some(&mut state))?;
+    }
+    state.context("missing isolated blend state")
+}
+struct IsolatedRetirement {
+    query: ID3D11Query,
+    targets: Vec<PreparedIsolatedLayer>,
+}
+fn start_isolated_retirement(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+) -> Result<std::sync::mpsc::Sender<IsolatedRetirement>> {
+    let (sender, receiver) = std::sync::mpsc::channel::<IsolatedRetirement>();
+    let device = device.clone();
+    let context = context.clone();
+    std::thread::Builder::new()
+        .name("gpui-d3d-retirement".into())
+        .spawn(move || {
+            for receipt in receiver {
+                loop {
+                    let mut done = windows::Win32::Foundation::BOOL(0);
+                    let result = unsafe {
+                        context.GetData(
+                            &receipt.query,
+                            Some((&mut done as *mut windows::Win32::Foundation::BOOL).cast()),
+                            std::mem::size_of_val(&done) as u32,
+                            D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
+                        )
+                    };
+                    if result.is_ok() && done.as_bool() {
+                        break;
+                    }
+                    let lost = unsafe { device.GetDeviceRemovedReason() }.is_err();
+                    if result.is_err() || lost {
+                        for target in &receipt.targets {
+                            target.fail();
+                        }
+                    }
+                    if lost {
+                        break;
+                    } // Device loss retires all work. Other errors do not.
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            }
+        })?;
+    Ok(sender)
+}
+impl DirectXRenderer {
+    pub(crate) fn prepare_isolated_layer(
+        &self,
+        window: WindowId,
+        scale: f32,
+        logical: Size<Pixels>,
+    ) -> Result<PreparedIsolatedLayer, IsolatedLayerError> {
+        use IsolatedLayerError as E;
+        let pixel_size = crate::isolated::target_pixel_size(logical, scale)?;
+        let bytes_per_pixel = (4usize * (2 + PATH_MULTISAMPLE_COUNT as usize)).max(24);
+        let bytes = (pixel_size.width as usize)
+            .checked_mul(pixel_size.height as usize)
+            .and_then(|n| n.checked_mul(bytes_per_pixel))
+            .ok_or(E::Limit)?;
+        let reservation = self.isolated_pool.reserve(bytes)?;
+        let allocate = || -> Result<IsolatedTextures> {
+            let device = &self.devices.device;
+            let texture = |samples, binds| -> Result<ID3D11Texture2D> {
+                let mut output = None;
+                let desc = D3D11_TEXTURE2D_DESC {
+                    Width: pixel_size.width,
+                    Height: pixel_size.height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: RENDER_TARGET_FORMAT,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: samples,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_DEFAULT,
+                    BindFlags: binds,
+                    ..Default::default()
+                };
+                unsafe {
+                    device.CreateTexture2D(&desc, None, Some(&mut output))?;
+                }
+                output.context("missing isolated texture")
+            };
+            let rtv = |texture: &ID3D11Texture2D| -> Result<_> {
+                let mut view = None;
+                unsafe {
+                    device.CreateRenderTargetView(texture, None, Some(&mut view))?;
+                }
+                Ok([Some(view.context("missing isolated RTV")?)])
+            };
+            let srv = |texture: &ID3D11Texture2D| -> Result<_> {
+                let mut view = None;
+                unsafe {
+                    device.CreateShaderResourceView(texture, None, Some(&mut view))?;
+                }
+                Ok([Some(view.context("missing isolated SRV")?)])
+            };
+            let color = texture(
+                1,
+                (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+            )?;
+            let color_view = rtv(&color)?;
+            let color_srv = srv(&color)?;
+            let paths = texture(
+                1,
+                (D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE).0 as u32,
+            )?;
+            let paths_srv = srv(&paths)?;
+            let msaa = texture(PATH_MULTISAMPLE_COUNT, D3D11_BIND_RENDER_TARGET.0 as u32)?;
+            let msaa_view = rtv(&msaa)?;
+            Ok(IsolatedTextures {
+                device: device.clone(),
+                color,
+                color_view,
+                color_srv,
+                paths,
+                paths_srv,
+                msaa,
+                msaa_view,
+                viewport: [D3D11_VIEWPORT {
+                    Width: pixel_size.width as f32,
+                    Height: pixel_size.height as f32,
+                    MaxDepth: 1.,
+                    ..Default::default()
+                }],
+                _reservation: reservation,
+            })
+        };
+        let textures = allocate().map_err(|error| {
+            log::error!("preparing isolated D3D target: {error:#}");
+            E::Device
+        })?;
+        Ok(PreparedIsolatedLayer {
+            window,
+            scale,
+            size: logical,
+            pixel_size,
+            failure: Arc::new(Default::default()),
+            recording: Arc::new(Default::default()),
+            directx: Arc::new(textures),
+        })
+    }
+    fn draw_isolated(&mut self, layer: &IsolatedPrimitive) -> Result<()> {
+        if let Err(error) = self.draw_isolated_inner(layer) {
+            layer.target.fail();
+            log::error!("isolated D3D encoding: {error:#}");
+        }
+        Ok(())
+    }
+    fn draw_isolated_inner(&mut self, layer: &IsolatedPrimitive) -> Result<()> {
+        if layer.target.is_failed() {
+            return Ok(());
+        }
+        let target = &layer.target.directx;
+        if target.device != self.devices.device {
+            layer.target.fail();
+            return Ok(());
+        }
+        // Each placement clears/re-records the shared target. Submission order
+        // ensures earlier sampling completes before a later reuse overwrites it.
+        unsafe {
+            self.devices
+                .device_context
+                .PSSetShaderResources(0, Some(&[None]));
+            self.devices
+                .device_context
+                .VSSetShaderResources(0, Some(&[None]));
+        }
+        let old_view = std::mem::replace(
+            &mut self.resources.render_target_view,
+            target.color_view.clone(),
+        );
+        let old_paths = std::mem::replace(
+            &mut self.resources.path_intermediate_texture,
+            target.paths.clone(),
+        );
+        let old_srv = std::mem::replace(
+            &mut self.resources.path_intermediate_srv,
+            target.paths_srv.clone(),
+        );
+        let old_msaa = std::mem::replace(
+            &mut self.resources.path_intermediate_msaa_texture,
+            target.msaa.clone(),
+        );
+        let old_msaa_view = std::mem::replace(
+            &mut self.resources.path_intermediate_msaa_view,
+            target.msaa_view.clone(),
+        );
+        let old_viewport = std::mem::replace(&mut self.resources.viewport, target.viewport);
+        if self.isolated_depth == 0 {
+            std::mem::swap(&mut self.pipelines, &mut self.isolated_pipelines);
+        }
+        self.isolated_depth += 1;
+        let result = self
+            .pre_draw()
+            .and_then(|_| self.draw_batches(&layer.scene));
+        self.isolated_depth -= 1;
+        if self.isolated_depth == 0 {
+            std::mem::swap(&mut self.pipelines, &mut self.isolated_pipelines);
+        }
+        self.resources.render_target_view = old_view;
+        self.resources.path_intermediate_texture = old_paths;
+        self.resources.path_intermediate_srv = old_srv;
+        self.resources.path_intermediate_msaa_texture = old_msaa;
+        self.resources.path_intermediate_msaa_view = old_msaa_view;
+        self.resources.viewport = old_viewport;
+        // Restore globals/target without clearing healthy parent siblings.
+        update_buffer(
+            &self.devices.device_context,
+            self.globals.global_params_buffer[0].as_ref().unwrap(),
+            &[GlobalParams {
+                gamma_ratios: self.font_info.gamma_ratios,
+                viewport_size: [
+                    self.resources.viewport[0].Width,
+                    self.resources.viewport[0].Height,
+                ],
+                grayscale_enhanced_contrast: self.font_info.grayscale_enhanced_contrast,
+                _pad: 0,
+            }],
+        )?;
+        unsafe {
+            self.devices
+                .device_context
+                .OMSetRenderTargets(Some(&self.resources.render_target_view), None);
+        }
+        if let Err(error) = result {
+            layer.target.fail();
+            log::error!("encoding isolated D3D layer: {error:#}");
+            return Ok(());
+        }
+        let sprite = IsolatedSprite {
+            bounds: layer.bounds,
+            content_mask: layer.content_mask.bounds,
+            opacity: layer.opacity,
+            pad: [0.; 3],
+        };
+        self.pipelines.isolated.update_buffer(
+            &self.devices.device,
+            &self.devices.device_context,
+            &[sprite],
+        )?;
+        self.pipelines.isolated.draw_with_texture(
+            &self.devices.device_context,
+            &target.color_srv,
+            &self.resources.viewport,
+            &self.globals.global_params_buffer,
+            &self.globals.sampler,
+            1,
+        )
+    }
+}
+
+#[cfg(test)]
+mod isolated_tests {
+    use super::*;
+    use crate::{ContentMask, ScaledPixels as S, rgba};
+    fn renderer() -> DirectXRenderer {
+        use windows::{Win32::UI::WindowsAndMessaging::*, core::w};
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE::default(),
+                w!("STATIC"),
+                w!("GPUI native isolation readback"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                64,
+                64,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
+        let devices = DirectXDevices::new().unwrap();
+        let mut renderer = DirectXRenderer::new(hwnd, &devices, true).unwrap();
+        renderer
+            .resize(size(DevicePixels(16), DevicePixels(16)))
+            .unwrap();
+        renderer
+    }
+    fn bounds(x: f32, y: f32, w: f32, h: f32) -> Bounds<S> {
+        Bounds::new(point(S(x), S(y)), size(S(w), S(h)))
+    }
+    fn quad(scene: &mut Scene, b: Bounds<S>, color: u32) {
+        scene.insert_primitive(Quad {
+            bounds: b,
+            content_mask: ContentMask {
+                bounds: bounds(0., 0., 64., 64.),
+            },
+            background: rgba(color).into(),
+            ..Default::default()
+        });
+    }
+    fn layer(renderer: &DirectXRenderer, scene: Scene, opacity: f32) -> IsolatedPrimitive {
+        let target = renderer
+            .prepare_isolated_layer(
+                WindowId::default(),
+                1.,
+                size(crate::px(16.), crate::px(16.)),
+            )
+            .unwrap();
+        IsolatedPrimitive {
+            order: 0,
+            bounds: bounds(0., 0., 17., 17.),
+            content_mask: ContentMask {
+                bounds: bounds(0., 0., 16., 16.),
+            },
+            opacity,
+            target,
+            scene: Arc::new(scene),
+        }
+    }
+
+    fn pixels(renderer: &mut DirectXRenderer, mut scene: Scene) -> Vec<u8> {
+        scene.finish();
+        renderer.pre_draw().unwrap();
+        renderer.draw_batches(&scene).unwrap();
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        unsafe {
+            renderer.resources.render_target.GetDesc(&mut desc);
+        }
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        desc.MiscFlags = 0;
+        let mut staging = None;
+        unsafe {
+            renderer
+                .devices
+                .device
+                .CreateTexture2D(&desc, None, Some(&mut staging))
+                .unwrap();
+        }
+        let staging = staging.unwrap();
+        unsafe {
+            renderer
+                .devices
+                .device_context
+                .CopyResource(&staging, &*renderer.resources.render_target);
+        }
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        unsafe {
+            renderer
+                .devices
+                .device_context
+                .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .unwrap();
+        }
+        let mut output = vec![0; 16 * 16 * 4];
+        for y in 0..16 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (mapped.pData as *const u8).add(y * mapped.RowPitch as usize),
+                    output.as_mut_ptr().add(y * 64),
+                    64,
+                );
+            }
+        }
+        unsafe {
+            renderer.devices.device_context.Unmap(&staging, 0);
+        }
+        output
+    }
+    fn pixel(image: &[u8], x: usize, y: usize) -> [u8; 4] {
+        image[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4]
+            .try_into()
+            .unwrap()
+    }
+    #[test]
+    fn native_isolation_composites_overlaps_nested_alpha_and_replay() {
+        let mut renderer = renderer();
+        for opacity in [0., 0.5, 1.] {
+            let mut child = Scene::default();
+            quad(&mut child, bounds(0., 0., 12., 12.), 0xff0000ff);
+            quad(&mut child, bounds(4., 4., 12., 12.), 0x0000ffff);
+            child.finish();
+            let group = layer(&renderer, child, opacity);
+            let mut scene = Scene::default();
+            quad(&mut scene, bounds(0., 0., 16., 16.), 0xffffffff);
+            scene.insert_primitive(crate::Primitive::Isolated(group));
+            let mut replay = Scene::default();
+            replay.replay(0..scene.len(), &scene);
+            drop(scene);
+            let image = pixels(&mut renderer, replay);
+            let faded = ((1. - opacity) * 255.).round() as u8;
+            assert_eq!(pixel(&image, 6, 6), [255, faded, faded, 255]);
+            assert_eq!(pixel(&image, 2, 2), [faded, faded, 255, 255]);
+        }
+        let mut leaf = Scene::default();
+        quad(&mut leaf, bounds(0., 0., 16., 16.), 0xff000080);
+        quad(&mut leaf, bounds(0., 0., 16., 16.), 0x0000ff80);
+        leaf.finish();
+        let inner = layer(&renderer, leaf, 0.5);
+        let mut child = Scene::default();
+        child.insert_primitive(crate::Primitive::Isolated(inner));
+        child.finish();
+        let outer = layer(&renderer, child, 0.5);
+        let mut scene = Scene::default();
+        scene.insert_primitive(crate::Primitive::Isolated(outer));
+        let image = pixels(&mut renderer, scene);
+        let actual = pixel(&image, 8, 8);
+        // BGRA premultiplied: blue .5*.25, red .5*.5*.25,
+        // alpha (.5 + .5*(1-.5))*.25. One unit allows UNORM rounding.
+        for (actual, expected) in actual.into_iter().zip([32i16, 0, 16, 48]) {
+            assert!(
+                (i16::from(actual) - expected).abs() <= 1,
+                "{actual} {expected}"
+            );
+        }
+    }
+    #[test]
+    fn repeated_target_placements_are_consumed_before_reuse() {
+        let mut renderer = renderer();
+        let mut red = Scene::default();
+        quad(&mut red, bounds(0., 0., 16., 16.), 0xff0000ff);
+        red.finish();
+        let first = layer(&renderer, red, 1.);
+        let mut blue = Scene::default();
+        quad(&mut blue, bounds(0., 0., 16., 16.), 0x0000ffff);
+        blue.finish();
+        let mut second = first.clone();
+        second.scene = Arc::new(blue);
+        second.content_mask.bounds = bounds(8., 0., 8., 16.);
+        let mut scene = Scene::default();
+        scene.insert_primitive(crate::Primitive::Isolated(first));
+        scene.insert_primitive(crate::Primitive::Isolated(second));
+        let image = pixels(&mut renderer, scene);
+        assert_eq!(pixel(&image, 2, 8), [0, 0, 255, 255]);
+        assert_eq!(pixel(&image, 12, 8), [255, 0, 0, 255]);
+    }
+    #[test]
+    fn poisoned_replayed_layer_does_not_suppress_window_or_siblings() {
+        let mut renderer = renderer();
+        let mut red = Scene::default();
+        quad(&mut red, bounds(0., 0., 16., 16.), 0xff0000ff);
+        red.finish();
+        let failed = layer(&renderer, red, 1.);
+        let owner = failed.target.clone();
+        let mut blue = Scene::default();
+        quad(&mut blue, bounds(8., 0., 8., 16.), 0x0000ffff);
+        blue.finish();
+        let healthy = layer(&renderer, blue, 1.);
+        let healthy_owner = healthy.target.clone();
+        let mut cached = Scene::default();
+        quad(&mut cached, bounds(0., 0., 16., 16.), 0xffffffff);
+        cached.insert_primitive(crate::Primitive::Isolated(failed));
+        cached.insert_primitive(crate::Primitive::Isolated(healthy));
+        let mut replay = Scene::default();
+        replay.replay(0..cached.len(), &cached);
+        owner.fail(); // completion after view recording, before cached replay
+        let image = pixels(&mut renderer, replay);
+        assert_eq!(pixel(&image, 2, 8), [255, 255, 255, 255]);
+        assert_eq!(pixel(&image, 12, 8), [255, 0, 0, 255]);
+        assert!(!healthy_owner.is_failed());
+    }
+
+    #[test]
+    fn pending_event_retains_target_after_all_preparing_owners_close() {
+        let renderer = renderer();
+        let target = renderer
+            .prepare_isolated_layer(WindowId::default(), 1., size(px(16.), px(16.)))
+            .unwrap();
+        let weak = Arc::downgrade(&target.directx);
+        let mut query = None;
+        unsafe {
+            renderer
+                .devices
+                .device
+                .CreateQuery(
+                    &D3D11_QUERY_DESC {
+                        Query: D3D11_QUERY_EVENT,
+                        MiscFlags: 0,
+                    },
+                    Some(&mut query),
+                )
+                .unwrap();
+        }
+        let query = query.unwrap();
+        // The worker is observing a genuinely pending native event. Neither
+        // dropping the window/preparing owner nor pending polls may release it.
+        renderer
+            .retirement
+            .send(IsolatedRetirement {
+                query: query.clone(),
+                targets: vec![target.clone()],
+            })
+            .ok()
+            .unwrap();
+        drop(target);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(weak.upgrade().is_some());
+        unsafe {
+            renderer.devices.device_context.End(&query);
+            renderer.devices.device_context.Flush();
+        }
+        drop(renderer);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while weak.upgrade().is_some() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(weak.upgrade().is_none());
+    }
+    #[test]
+    fn quota_charges_all_six_bgra_samples_before_native_creation() {
+        let renderer = renderer();
+        assert!(matches!(
+            renderer.prepare_isolated_layer(WindowId::default(), 2., size(px(1600.), px(1000.))),
+            Err(IsolatedLayerError::Limit)
+        ));
+        let size = size(px(300.), px(200.));
+        let mut targets = Vec::new();
+        loop {
+            match renderer.prepare_isolated_layer(WindowId::default(), 2., size) {
+                Ok(target) => targets.push(target),
+                Err(IsolatedLayerError::Limit) => break,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        assert!(!targets.is_empty());
+        assert!(targets.len() < 10);
+        let replay = targets.last().unwrap().clone();
+        targets.clear();
+        assert!(
+            renderer
+                .prepare_isolated_layer(WindowId::default(), 2., size)
+                .is_ok()
+        );
+        replay.fail();
+        assert!(replay.is_failed());
     }
 }

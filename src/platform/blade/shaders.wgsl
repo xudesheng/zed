@@ -1294,3 +1294,27 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
 
     return ycbcr_to_RGB * y_cb_cr;
 }
+
+// Single premultiplied composite of a separately recorded native Scene.
+struct IsolatedParams { bounds: Bounds, content_mask: Bounds, opacity: f32, pad0: f32, pad1: f32, pad2: f32 }
+var<uniform> isolated_locals: IsolatedParams;
+var t_isolated: texture_2d<f32>;
+struct IsolatedVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) clip_distances: vec4<f32>,
+}
+@vertex
+fn vs_isolated(@builtin(vertex_index) vertex_id: u32) -> IsolatedVarying {
+    let uv = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    var out: IsolatedVarying;
+    out.position = to_device_position(uv, isolated_locals.bounds);
+    out.uv = uv;
+    out.clip_distances = distance_from_clip_rect(uv, isolated_locals.bounds, isolated_locals.content_mask);
+    return out;
+}
+@fragment
+fn fs_isolated(input: IsolatedVarying) -> @location(0) vec4<f32> {
+    if any(input.clip_distances < vec4<f32>(0.0)) { discard; }
+    return textureSample(t_isolated, s_sprite, input.uv) * isolated_locals.opacity;
+}

@@ -1180,3 +1180,26 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }
+
+// The target contains premultiplied source-over colour. Apply group opacity
+// exactly once to both RGB and alpha, then composite with ONE/INV_SRC_ALPHA.
+struct IsolatedSprite { Bounds bounds; Bounds content_mask; float opacity; float3 pad; };
+StructuredBuffer<IsolatedSprite> isolated_sprites: register(t1);
+struct IsolatedVertexOutput {
+    float4 position: SV_Position;
+    float2 uv: TEXCOORD0;
+    nointerpolation float opacity: TEXCOORD1;
+    float4 clip_distance: SV_ClipDistance;
+};
+IsolatedVertexOutput isolated_vertex(uint vertex_id: SV_VertexID, uint instance_id: SV_InstanceID) {
+    float2 uv = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    IsolatedSprite sprite = isolated_sprites[instance_id];
+    IsolatedVertexOutput output;
+    output.position = to_device_position(uv, sprite.bounds);
+    output.clip_distance = distance_from_clip_rect(uv, sprite.bounds, sprite.content_mask);
+    output.uv = uv; output.opacity = sprite.opacity;
+    return output;
+}
+float4 isolated_fragment(IsolatedVertexOutput input): SV_Target {
+    return t_sprite.Sample(s_sprite, input.uv) * input.opacity;
+}

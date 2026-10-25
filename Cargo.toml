@@ -239,7 +239,8 @@ version = "0.3"
 optional = true
 
 [dependencies.blade-graphics]
-version = "0.7.0"
+git = "https://github.com/xudesheng/blade"
+rev = "241752f1a3fe8e27ea2430ecf1e822953f5526c9"
 optional = true
 
 [dependencies.blade-macros]
@@ -247,7 +248,8 @@ version = "0.3.0"
 optional = true
 
 [dependencies.blade-util]
-version = "0.3.0"
+git = "https://github.com/xudesheng/blade"
+rev = "241752f1a3fe8e27ea2430ecf1e822953f5526c9"
 optional = true
 
 [dependencies.bytemuck]
@@ -461,7 +463,8 @@ optional = true
 default-features = false
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.blade-graphics]
-version = "0.7.0"
+git = "https://github.com/xudesheng/blade"
+rev = "241752f1a3fe8e27ea2430ecf1e822953f5526c9"
 optional = true
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.blade-macros]
@@ -469,7 +472,8 @@ version = "0.3.0"
 optional = true
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.blade-util]
-version = "0.3.0"
+git = "https://github.com/xudesheng/blade"
+rev = "241752f1a3fe8e27ea2430ecf1e822953f5526c9"
 optional = true
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies.bytemuck]
