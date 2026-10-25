@@ -2333,7 +2333,7 @@ mod isolated_tests {
             .try_into()
             .unwrap()
     }
-    #[test]
+    #[::core::prelude::v1::test]
     fn native_isolation_composites_overlaps_nested_alpha_and_replay() {
         let mut renderer = renderer();
         for opacity in [0., 0.5, 1.] {
@@ -2375,7 +2375,7 @@ mod isolated_tests {
             );
         }
     }
-    #[test]
+    #[::core::prelude::v1::test]
     fn repeated_target_placements_are_consumed_before_reuse() {
         let mut renderer = renderer();
         let mut red = Scene::default();
@@ -2395,7 +2395,7 @@ mod isolated_tests {
         assert_eq!(pixel(&image, 2, 8), [0, 0, 255, 255]);
         assert_eq!(pixel(&image, 12, 8), [255, 0, 0, 255]);
     }
-    #[test]
+    #[::core::prelude::v1::test]
     fn poisoned_replayed_layer_does_not_suppress_window_or_siblings() {
         let mut renderer = renderer();
         let mut red = Scene::default();
@@ -2421,7 +2421,7 @@ mod isolated_tests {
         assert!(!healthy_owner.is_failed());
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn pending_event_retains_target_after_all_preparing_owners_close() {
         let renderer = renderer();
         let target = renderer
@@ -2467,7 +2467,7 @@ mod isolated_tests {
         }
         assert!(weak.upgrade().is_none());
     }
-    #[test]
+    #[::core::prelude::v1::test]
     fn quota_charges_all_six_bgra_samples_before_native_creation() {
         let renderer = renderer();
         assert!(matches!(
@@ -2495,7 +2495,7 @@ mod isolated_tests {
         replay.fail();
         assert!(replay.is_failed());
     }
-    #[test]
+    #[::core::prelude::v1::test]
     fn isolated_paths_resolve_aa_and_composite_premultiplied_once() {
         let mut renderer = renderer();
         let mut child = Scene::default();
