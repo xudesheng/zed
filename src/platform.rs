@@ -15,13 +15,13 @@ mod mac;
     ),
     all(target_os = "macos", feature = "macos-blade")
 ))]
-pub(crate) mod blade;
+mod blade;
 
 #[cfg(any(test, feature = "test-support"))]
 mod test;
 
 #[cfg(target_os = "windows")]
-pub(crate) mod windows;
+mod windows;
 
 #[cfg(all(
     feature = "screen-capture",
@@ -1883,3 +1883,6 @@ impl From<String> for ClipboardString {
         }
     }
 }
+
+#[cfg(any(target_os = "linux", target_os = "freebsd"))]
+pub(crate) use blade::IsolatedTextures as BladeIsolatedTextures;

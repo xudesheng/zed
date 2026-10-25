@@ -43,9 +43,9 @@ pub struct PreparedIsolatedLayer {
     #[cfg(all(target_os = "macos", not(feature = "macos-blade")))]
     pub(crate) metal: Arc<crate::metal_renderer::IsolatedTextures>,
     #[cfg(target_os = "windows")]
-    pub(crate) directx: Arc<crate::platform::windows::IsolatedTextures>,
+    pub(crate) directx: Arc<crate::IsolatedTextures>,
     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
-    pub(crate) blade: Arc<crate::platform::blade::IsolatedTextures>,
+    pub(crate) blade: Arc<crate::platform::BladeIsolatedTextures>,
 }
 impl std::fmt::Debug for PreparedIsolatedLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

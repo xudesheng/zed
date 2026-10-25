@@ -851,7 +851,8 @@ impl PlatformWindow for WindowsWindow {
         scale: f32,
         size: Size<Pixels>,
     ) -> std::result::Result<crate::PreparedIsolatedLayer, crate::IsolatedLayerError> {
-        self.state
+        self.0
+            .state
             .borrow()
             .renderer
             .prepare_isolated_layer(window, scale, size)
