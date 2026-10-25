@@ -2108,6 +2108,19 @@ impl DirectXRenderer {
         self.resources.path_intermediate_msaa_texture = old_msaa;
         self.resources.path_intermediate_msaa_view = old_msaa_view;
         self.resources.viewport = old_viewport;
+        unsafe {
+            // Native context bindings are owners too. Drop child SRV/RTV
+            // bindings before any fallible parent-global update.
+            self.devices
+                .device_context
+                .PSSetShaderResources(0, Some(&[None]));
+            self.devices
+                .device_context
+                .VSSetShaderResources(0, Some(&[None]));
+            self.devices
+                .device_context
+                .OMSetRenderTargets(Some(&self.resources.render_target_view), None);
+        }
         // Restore globals/target without clearing healthy parent siblings.
         update_buffer(
             &self.devices.device_context,
@@ -2122,11 +2135,6 @@ impl DirectXRenderer {
                 _pad: 0,
             }],
         )?;
-        unsafe {
-            self.devices
-                .device_context
-                .OMSetRenderTargets(Some(&self.resources.render_target_view), None);
-        }
         if let Err(error) = result {
             layer.target.fail();
             log::error!("encoding isolated D3D layer: {error:#}");
@@ -2143,14 +2151,23 @@ impl DirectXRenderer {
             &self.devices.device_context,
             &[sprite],
         )?;
-        self.pipelines.isolated.draw_with_texture(
+        let result = self.pipelines.isolated.draw_with_texture(
             &self.devices.device_context,
             &target.color_srv,
             &self.resources.viewport,
             &self.globals.global_params_buffer,
             &self.globals.sampler,
             1,
-        )
+        );
+        unsafe {
+            self.devices
+                .device_context
+                .PSSetShaderResources(0, Some(&[None]));
+            self.devices
+                .device_context
+                .VSSetShaderResources(0, Some(&[None]));
+        }
+        result
     }
 }
 
@@ -2247,6 +2264,24 @@ mod isolated_tests {
         scene.finish();
         renderer.pre_draw().unwrap();
         renderer.draw_batches(&scene).unwrap();
+        // A completed receipt may release its lease: the immediate context
+        // must not silently retain an uncharged isolated attachment.
+        let mut bound = [None];
+        unsafe {
+            renderer
+                .devices
+                .device_context
+                .PSGetShaderResources(0, Some(&mut bound));
+        }
+        assert!(bound[0].is_none());
+        unsafe {
+            renderer
+                .devices
+                .device_context
+                .VSGetShaderResources(0, Some(&mut bound));
+        }
+        assert!(bound[0].is_none());
+
         let mut desc = D3D11_TEXTURE2D_DESC::default();
         unsafe {
             renderer.resources.render_target.GetDesc(&mut desc);
