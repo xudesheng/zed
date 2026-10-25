@@ -311,16 +311,22 @@ impl DirectXRenderer {
             None
         } else {
             let mut query = None;
-            unsafe {
+            let created = unsafe {
                 self.devices.device.CreateQuery(
                     &D3D11_QUERY_DESC {
                         Query: D3D11_QUERY_EVENT,
                         MiscFlags: 0,
                     },
                     Some(&mut query),
-                )?;
+                )
+            };
+            if let Err(error) = created {
+                for target in &targets {
+                    target.fail();
+                }
+                return Err(error.into());
             }
-            query
+            Some(query.context("missing native retirement query")?)
         };
         let result = self.pre_draw().and_then(|_| self.draw_batches(scene));
         if let Some(query) = query {
@@ -1858,7 +1864,7 @@ mod dxgi {
 // retaining the accepted 24-byte/physical-pixel minimum.
 pub(crate) struct IsolatedTextures {
     device: ID3D11Device,
-    color: ID3D11Texture2D,
+    _color: ID3D11Texture2D,
     color_view: [Option<ID3D11RenderTargetView>; 1],
     color_srv: [Option<ID3D11ShaderResourceView>; 1],
     paths: ID3D11Texture2D,
@@ -2008,7 +2014,7 @@ impl DirectXRenderer {
             let msaa_view = rtv(&msaa)?;
             Ok(IsolatedTextures {
                 device: device.clone(),
-                color,
+                _color: color,
                 color_view,
                 color_srv,
                 paths,
@@ -2427,5 +2433,32 @@ mod isolated_tests {
         );
         replay.fail();
         assert!(replay.is_failed());
+    }
+    #[test]
+    fn isolated_paths_resolve_aa_and_composite_premultiplied_once() {
+        let mut renderer = renderer();
+        let mut child = Scene::default();
+        for color in [0xff000080, 0x0000ff80] {
+            let mut path = Path::new(point(px(0.), px(0.)));
+            path.line_to(point(px(16.), px(0.)));
+            path.line_to(point(px(16.), px(16.)));
+            path.line_to(point(px(0.), px(16.)));
+            path.line_to(point(px(0.), px(0.)));
+            path.color = rgba(color).into();
+            path.content_mask = ContentMask {
+                bounds: Bounds::new(point(px(0.), px(0.)), size(px(16.), px(16.))),
+            };
+            child.insert_primitive(path.scale(1.));
+        }
+        child.finish();
+        let mut scene = Scene::default();
+        scene.insert_primitive(Primitive::Isolated(layer(&renderer, child, 0.5)));
+        let image = pixels(&mut renderer, scene);
+        for (actual, expected) in pixel(&image, 8, 8).into_iter().zip([64i16, 0, 32, 96]) {
+            assert!(
+                (i16::from(actual) - expected).abs() <= 2,
+                "{actual} {expected}"
+            );
+        }
     }
 }

@@ -300,7 +300,7 @@ pub(crate) fn target_pixel_size(
     scale: f32,
 ) -> Result<Size<u32>, IsolatedLayerError> {
     let dimension = |n: Pixels| {
-        let n = (f32::from(n) * scale).ceil() + 1.;
+        let n = (f64::from(f32::from(n)) * f64::from(scale)).ceil() + 1.;
         if !n.is_finite() || n < 1. || n > 16384. {
             Err(IsolatedLayerError::Limit)
         } else {
@@ -311,4 +311,69 @@ pub(crate) fn target_pixel_size(
         dimension(logical.width)?,
         dimension(logical.height)?,
     ))
+}
+
+#[cfg(test)]
+mod scene_isolated_tests {
+    use super::*;
+    use crate::{
+        AtlasTextureId, AtlasTextureKind, AtlasTile, ContentMask, DevicePixels, MonochromeSprite,
+        ScaledPixels as S, TileId, TransformationMatrix, point, size,
+    };
+    #[test]
+    fn integer_translation_preserves_affine_glyph_phase_and_clips() {
+        // Known geometry, independent of any font metric/raster-size estimate.
+        let origin = point(S(17.), S(29.));
+        let glyph = Bounds::new(point(S(21.25), S(33.5)), size(S(8.), S(10.)));
+        let matrix = TransformationMatrix {
+            rotation_scale: [[0.5, -1.], [1., 0.5]],
+            translation: [3.25, -1.5],
+        };
+        let clip = ContentMask {
+            bounds: Bounds::new(point(S(18.), S(30.)), size(S(40.), S(40.))),
+        };
+        let mut scene = crate::Scene::default();
+        scene.monochrome_sprites.push(MonochromeSprite {
+            order: 0,
+            pad: 0,
+            bounds: glyph,
+            content_mask: clip.clone(),
+            color: Default::default(),
+            transformation: matrix,
+            tile: AtlasTile {
+                texture_id: AtlasTextureId {
+                    index: 0,
+                    kind: AtlasTextureKind::Monochrome,
+                },
+                tile_id: TileId(0),
+                padding: 0,
+                bounds: Bounds::new(
+                    point(DevicePixels(0), DevicePixels(0)),
+                    size(DevicePixels(8), DevicePixels(10)),
+                ),
+            },
+        });
+        scene.translate_for_isolation(origin);
+        let sprite = &scene.monochrome_sprites[0];
+        let transform = |m: TransformationMatrix, p: crate::Point<S>| {
+            point(
+                S(m.rotation_scale[0][0] * p.x.0
+                    + m.rotation_scale[0][1] * p.y.0
+                    + m.translation[0]),
+                S(m.rotation_scale[1][0] * p.x.0
+                    + m.rotation_scale[1][1] * p.y.0
+                    + m.translation[1]),
+            )
+        };
+        assert_eq!(
+            transform(matrix, glyph.origin) - origin,
+            transform(sprite.transformation, sprite.bounds.origin)
+        );
+        assert_eq!(sprite.bounds.origin.x.0.fract(), glyph.origin.x.0.fract());
+        assert_eq!(sprite.bounds.origin.y.0.fract(), glyph.origin.y.0.fract());
+        assert_eq!(
+            sprite.content_mask.bounds.origin,
+            clip.bounds.origin - origin
+        );
+    }
 }
