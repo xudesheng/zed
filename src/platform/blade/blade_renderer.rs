@@ -155,6 +155,7 @@ impl BladePipelines {
         });
         shader.check_struct_size::<GlobalParams>();
         shader.check_struct_size::<SurfaceParams>();
+        shader.check_struct_size::<IsolatedParams>();
         shader.check_struct_size::<Quad>();
         shader.check_struct_size::<Shadow>();
         shader.check_struct_size::<PathRasterizationVertex>();

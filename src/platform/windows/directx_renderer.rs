@@ -1914,11 +1914,11 @@ fn start_isolated_retirement(
         .spawn(move || {
             for receipt in receiver {
                 loop {
-                    let mut done = windows::Win32::Foundation::BOOL(0);
+                    let mut done = windows::core::BOOL(0);
                     let result = unsafe {
                         context.GetData(
                             &receipt.query,
-                            Some((&mut done as *mut windows::Win32::Foundation::BOOL).cast()),
+                            Some((&mut done as *mut windows::core::BOOL).cast()),
                             std::mem::size_of_val(&done) as u32,
                             D3D11_ASYNC_GETDATA_DONOTFLUSH.0 as u32,
                         )
