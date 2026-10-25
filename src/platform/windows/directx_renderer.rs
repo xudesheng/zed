@@ -304,6 +304,14 @@ impl DirectXRenderer {
     }
 
     pub(crate) fn draw(&mut self, scene: &Scene) -> Result<()> {
+        self.draw_with_present(scene, |renderer| renderer.present())
+    }
+
+    fn draw_with_present(
+        &mut self,
+        scene: &Scene,
+        present: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
         let mut targets = Vec::new();
         crate::isolated::collect_isolated_targets(scene, &mut targets);
         // Query allocation is fallible and precedes all layer commands.
@@ -349,7 +357,18 @@ impl DirectXRenderer {
             }
         }
         result?;
-        self.present()
+        let presented = present(self);
+        if presented.is_err() {
+            // The event may already have retired successfully before Present
+            // reports a terminal error. Notify the generation independently;
+            // its receipt still owns resources until actual retirement.
+            let mut targets = Vec::new();
+            crate::isolated::collect_isolated_targets(scene, &mut targets);
+            for target in &targets {
+                target.fail();
+            }
+        }
+        presented
     }
 
     fn draw_batches(&mut self, scene: &Scene) -> Result<()> {
@@ -2521,5 +2540,27 @@ mod isolated_tests {
                 "{actual} {expected}"
             );
         }
+    }
+    #[::core::prelude::v1::test]
+    fn presentation_error_wakes_existing_and_late_generation_waiters() {
+        let mut renderer = renderer();
+        let mut child = Scene::default();
+        quad(&mut child, bounds(0., 0., 16., 16.), 0xff0000ff);
+        child.finish();
+        let group = layer(&renderer, child, 0.5);
+        let owner = group.target.clone();
+        let existing = owner.failure();
+        let mut scene = Scene::default();
+        scene.insert_primitive(Primitive::Isolated(group));
+        scene.finish();
+        // Real GPU encoding/submission, followed by a deterministic terminal
+        // presentation result. No device reset or desktop disruption is needed.
+        let result = renderer.draw_with_present(&scene, |_| {
+            Err(anyhow::anyhow!("injected terminal presentation error"))
+        });
+        assert!(result.is_err());
+        assert!(owner.is_failed());
+        assert!(futures::FutureExt::now_or_never(existing).is_some());
+        assert!(futures::FutureExt::now_or_never(owner.failure()).is_some());
     }
 }
